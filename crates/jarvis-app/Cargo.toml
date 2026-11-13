@@ -1,0 +1,23 @@
+[package]
+name = "jarvis-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Jarvis for Windows: native Rune shell and first-run setup"
+
+[lib]
+name = "jarvis_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jarvis"
+path = "src/main.rs"
+
+[dependencies]
+jarvis-core = { path = "../jarvis-core" }
+jarvis-platform = { path = "../jarvis-platform" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "6ba947e580f2d864bb333d913ba843284e57f427" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/jarvis-core",
+    "crates/jarvis-platform",
+    "crates/jarvis-app",
+]
+
+# Rune ships patched copies of these crates and expects apps that build it to
+# apply the same patches. The directories under vendor/ are copied verbatim
+# from the pinned Rune revision; the .patch files document the changes.
+[patch.crates-io]
+winit = { path = "vendor/winit" }
+wgpu-hal = { path = "vendor/wgpu-hal" }
+parley_engine = { path = "vendor/parley_engine" }
+accesskit_windows = { path = "vendor/accesskit_windows" }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+dirs = "7"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
