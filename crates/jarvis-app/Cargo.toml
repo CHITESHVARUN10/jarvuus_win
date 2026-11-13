@@ -14,9 +14,14 @@ path = "src/lib.rs"
 name = "jarvis"
 path = "src/main.rs"
 
+[features]
+default = []
+gpu-vulkan = ["jarvis-models/gpu-vulkan"]
+
 [dependencies]
 jarvis-core = { path = "../jarvis-core" }
 jarvis-platform = { path = "../jarvis-platform" }
+jarvis-models = { path = "../jarvis-models" }
 rune = { git = "https://github.com/anomalyco/rune", rev = "6ba947e580f2d864bb333d913ba843284e57f427" }
 
 [dev-dependencies]

@@ -1,0 +1,38 @@
+[package]
+name = "jarvis-models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Model downloads, verified releases and inference warm-up for Jarvis"
+
+[dependencies]
+jarvis-core = { path = "../jarvis-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+reqwest.workspace = true
+sha2 = "0.10"
+tempfile = "3"
+
+whisper-rs = { version = "0.13", default-features = false, optional = true }
+sentencepiece = { version = "=0.14.0", features = ["static"], optional = true }
+
+# Windows ships a DirectML-enabled ONNX Runtime from ort's pinned distribution
+# and links it into the binary. Windows also gets the runtime's DirectML and
+# CPU providers; the engine tries DirectML first and falls back to CPU.
+[target.'cfg(windows)'.dependencies]
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "copy-dylibs", "tls-native", "api-31", "directml"], optional = true }
+
+# Development on other platforms loads ONNX Runtime dynamically only when the
+# intent engine is actually used, so UI tests stay light.
+[target.'cfg(not(windows))'.dependencies]
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-31"], optional = true }
+
+[features]
+default = ["inference"]
+inference = ["dep:ort", "dep:whisper-rs", "dep:sentencepiece"]
+gpu-vulkan = ["inference", "whisper-rs/vulkan"]
+
+[dev-dependencies]
+tempfile = "3"

@@ -6,6 +6,7 @@ use jarvis_core::models;
 use jarvis_core::paths::AppPaths;
 use jarvis_core::settings::{AppSettings, ThemeChoice};
 use jarvis_core::setup::{SetupAction, SetupItem, SetupKind, SetupReport, SetupStatus};
+use jarvis_models::manager::{ModelKind, ModelManager, ModelPhase, ModelUpdate};
 use rune::{Tx, Waker};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +112,37 @@ impl Notice {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ModelsUi {
+    pub speech: ModelUpdate,
+    pub intent: ModelUpdate,
+}
+
+impl ModelsUi {
+    pub fn get(&self, kind: ModelKind) -> &ModelUpdate {
+        match kind {
+            ModelKind::Speech => &self.speech,
+            ModelKind::Intent => &self.intent,
+        }
+    }
+
+    pub fn apply(&mut self, update: ModelUpdate) {
+        match update.kind {
+            ModelKind::Speech => self.speech = update,
+            ModelKind::Intent => self.intent = update,
+        }
+    }
+
+    pub fn has_active_job(&self, kind: ModelKind) -> bool {
+        let update = self.get(kind);
+        update.phase.is_busy()
+            || matches!(
+                update.phase,
+                ModelPhase::Ready | ModelPhase::Error | ModelPhase::Cancelled
+            )
+    }
+}
+
 pub struct Jarvis {
     pub paths: AppPaths,
     pub settings: AppSettings,
@@ -121,7 +153,10 @@ pub struct Jarvis {
     pub setup_error: Option<String>,
     pub notice: Option<Notice>,
     pub version: &'static str,
+    pub models: ModelsUi,
+    pub model_manager: ModelManager,
     rx: Option<Receiver<SetupReport>>,
+    model_rx: Receiver<ModelUpdate>,
     waker: Option<Waker>,
 }
 
@@ -150,6 +185,13 @@ impl Jarvis {
             (Section::Settings, SettingsPage::Setup)
         };
 
+        let models = ModelsUi {
+            speech: ModelUpdate::initial(&paths, ModelKind::Speech),
+            intent: ModelUpdate::initial(&paths, ModelKind::Intent),
+        };
+        let (model_sender, model_rx) = mpsc::channel();
+        let model_manager = ModelManager::new(paths.clone(), model_sender);
+
         Self {
             paths,
             settings,
@@ -160,7 +202,10 @@ impl Jarvis {
             setup_error: None,
             notice,
             version: env!("CARGO_PKG_VERSION"),
+            models,
+            model_manager,
             rx: None,
+            model_rx,
             waker: None,
         }
     }
@@ -178,6 +223,12 @@ impl Jarvis {
 
     pub fn with_state(paths: AppPaths, settings: AppSettings) -> Self {
         let completed = settings.setup_completed;
+        let models = ModelsUi {
+            speech: ModelUpdate::initial(&paths, ModelKind::Speech),
+            intent: ModelUpdate::initial(&paths, ModelKind::Intent),
+        };
+        let (model_sender, model_rx) = mpsc::channel();
+        let model_manager = ModelManager::new(paths.clone(), model_sender);
         Self {
             paths,
             settings,
@@ -196,7 +247,10 @@ impl Jarvis {
             setup_error: None,
             notice: None,
             version: env!("CARGO_PKG_VERSION"),
+            models,
+            model_manager,
             rx: None,
+            model_rx,
             waker: None,
         }
     }
@@ -264,6 +318,44 @@ impl Jarvis {
         self.setup_running = false;
         self.setup = report;
         self.rx = None;
+
+        let active: Vec<ModelUpdate> = [self.models.speech.clone(), self.models.intent.clone()]
+            .into_iter()
+            .filter(|update| self.models.has_active_job(update.kind))
+            .collect();
+        for update in active {
+            self.apply_model_update(update);
+        }
+    }
+
+    pub fn install_model(&mut self, kind: ModelKind) {
+        self.model_manager.install(kind);
+    }
+
+    pub fn load_model(&mut self, kind: ModelKind) {
+        self.model_manager.load(kind);
+    }
+
+    pub fn cancel_model(&mut self, kind: ModelKind) {
+        self.model_manager.cancel(kind);
+    }
+
+    pub fn apply_model_update(&mut self, update: ModelUpdate) {
+        let kind = match update.kind {
+            ModelKind::Speech => SetupKind::SpeechModel,
+            ModelKind::Intent => SetupKind::IntentModel,
+        };
+        let status = match update.phase {
+            ModelPhase::Missing => SetupStatus::Missing,
+            ModelPhase::Installed | ModelPhase::Ready => SetupStatus::Ready,
+            ModelPhase::Downloading | ModelPhase::Verifying | ModelPhase::Loading => {
+                SetupStatus::Checking
+            }
+            ModelPhase::Error => SetupStatus::Incomplete,
+            ModelPhase::Cancelled => SetupStatus::Warning,
+        };
+        self.setup.update_item(kind, status, update.detail.clone());
+        self.models.apply(update);
     }
 
     pub fn finish_setup(&mut self) {
@@ -401,6 +493,7 @@ impl Default for Jarvis {
 
 pub fn setup_hook(state: &mut Jarvis, waker: Waker) {
     state.waker = Some(waker.clone());
+    state.model_manager.set_notifier(waker.clone());
     if state.setup.checked_at.is_some() {
         return;
     }
@@ -408,6 +501,12 @@ pub fn setup_hook(state: &mut Jarvis, waker: Waker) {
 }
 
 pub fn poll(state: &mut Jarvis, _clock: f64, _tx: &mut Tx) -> bool {
+    let mut changed = false;
+    while let Ok(update) = state.model_rx.try_recv() {
+        state.apply_model_update(update);
+        changed = true;
+    }
+
     let result = state.rx.as_ref().map(Receiver::try_recv);
     match result {
         Some(Ok(report)) => {
@@ -420,7 +519,7 @@ pub fn poll(state: &mut Jarvis, _clock: f64, _tx: &mut Tx) -> bool {
             state.setup_error = Some("Setup checks stopped unexpectedly. Try again.".into());
             true
         }
-        Some(Err(TryRecvError::Empty)) | None => false,
+        Some(Err(TryRecvError::Empty)) | None => changed,
     }
 }
 
@@ -474,5 +573,36 @@ mod tests {
         assert_eq!(partial.essentials_ready, 1);
         assert!(ready.essentials_complete());
         assert_eq!(ready.essentials_total, 3);
+    }
+
+    #[test]
+    fn model_updates_change_the_setup_rows_and_essentials() {
+        let mut state = Jarvis::for_test();
+        state.apply_report(Jarvis::demo_report(false));
+        assert_eq!(
+            state.setup.item(SetupKind::SpeechModel).unwrap().status,
+            SetupStatus::Missing
+        );
+
+        state.apply_model_update(ModelUpdate::new(
+            ModelKind::Speech,
+            ModelPhase::Downloading,
+            "50%",
+        ));
+        assert_eq!(
+            state.setup.item(SetupKind::SpeechModel).unwrap().status,
+            SetupStatus::Checking
+        );
+
+        state.apply_model_update(ModelUpdate::new(
+            ModelKind::Speech,
+            ModelPhase::Ready,
+            "loaded",
+        ));
+        assert_eq!(
+            state.setup.item(SetupKind::SpeechModel).unwrap().status,
+            SetupStatus::Ready
+        );
+        assert_eq!(state.setup.essentials_ready, 2);
     }
 }

@@ -1,6 +1,7 @@
 use jarvis_core::models;
 use jarvis_core::setup::{SetupItem, SetupStatus};
 use jarvis_core::ThemeChoice;
+use jarvis_models::manager::{ModelKind, ModelPhase};
 use rune::tok::{self, radius, space, type_, Theme};
 use rune::{col, el, oklch, row, text, Color, Cx, El, ScrollSpec, TextStyle};
 
@@ -314,7 +315,7 @@ fn sidebar_footer(state: &Jarvis, p: Paint) -> El {
                 .justify_between()
                 .gap(10.0)
                 .child(
-                    text(format!("v{} · phase 1", state.version))
+                    text(format!("v{} · phase 2", state.version))
                         .font(TextStyle::new(11.0, 500.0))
                         .color(p.t.text_secondary),
                 )
@@ -589,7 +590,7 @@ fn setup_hero(state: &Jarvis, p: Paint) -> El {
             row()
                 .gap(12.0)
                 .center_y()
-                .child(progress_bar(p, 260.0, fraction))
+                .child(progress_bar(p, "setup-progress", 260.0, fraction))
                 .child(
                     text(format!(
                         "{} of {} essentials ready",
@@ -601,10 +602,10 @@ fn setup_hero(state: &Jarvis, p: Paint) -> El {
         )
 }
 
-fn progress_bar(p: Paint, width: f32, fraction: f32) -> El {
+fn progress_bar(p: Paint, key: &str, width: f32, fraction: f32) -> El {
     let fraction = fraction.clamp(0.0, 1.0);
     row()
-        .key("setup-progress")
+        .key(key.to_string())
         .h(6.0)
         .w(width)
         .radius(3.0)
@@ -630,14 +631,48 @@ fn setup_items(state: &Jarvis, p: Paint) -> El {
                     .fill(p.t.separator),
             );
         }
-        list = list.child(setup_row(p, item));
+        list = list.child(setup_row(state, p, item));
     }
 
     card(p, "setup-items").child(list)
 }
 
-fn setup_row(p: Paint, item: &SetupItem) -> El {
-    let color = status_color(p, item.status);
+fn setup_row(state: &Jarvis, p: Paint, item: &SetupItem) -> El {
+    let kind = match item.kind {
+        jarvis_core::SetupKind::SpeechModel => Some(ModelKind::Speech),
+        jarvis_core::SetupKind::IntentModel => Some(ModelKind::Intent),
+        _ => None,
+    };
+    let update = kind.map(|kind| state.models.get(kind));
+    let model_owns_display = update.is_some_and(|update| {
+        update.phase.is_busy()
+            || matches!(
+                update.phase,
+                ModelPhase::Ready | ModelPhase::Error | ModelPhase::Cancelled
+            )
+    });
+    let status = if model_owns_display {
+        update
+            .map(|update| model_status(update.phase))
+            .unwrap_or(item.status)
+    } else {
+        item.status
+    };
+    let status_label = if model_owns_display {
+        update
+            .map(|update| update.phase.label())
+            .unwrap_or(item.status.label())
+    } else {
+        item.status.label()
+    };
+    let detail = if model_owns_display {
+        update
+            .map(|update| update.detail.clone())
+            .unwrap_or_else(|| item.detail.clone())
+    } else {
+        item.detail.clone()
+    };
+    let color = status_color(p, status);
     let key = format!("setup-row-{}", item.key());
 
     let mut line = row()
@@ -649,7 +684,7 @@ fn setup_row(p: Paint, item: &SetupItem) -> El {
         .center_y()
         .child(el().size(10.0, 10.0).radius(5.0).fill(color).a11y_hidden());
 
-    let text_column = col()
+    let mut text_column = col()
         .grow(1.0)
         .min_w(0.0)
         .gap(4.0)
@@ -669,19 +704,42 @@ fn setup_row(p: Paint, item: &SetupItem) -> El {
                         .radius(10.0)
                         .center()
                         .fill(color.alpha(0.14))
-                        .child(text(item.status.label()).font(type_::LABEL).color(color)),
+                        .child(text(status_label).font(type_::LABEL).color(color)),
                 ),
         )
         .child(
-            text(item.detail.clone())
+            text(detail)
                 .w_full()
                 .font(type_::LABEL)
                 .color(p.t.text_secondary),
         );
 
+    if let Some(update) = update {
+        if update.phase.is_busy() {
+            text_column = text_column.child(
+                row()
+                    .gap(10.0)
+                    .center_y()
+                    .child(progress_bar(
+                        p,
+                        &format!("model-progress-{}", update.kind.key()),
+                        220.0,
+                        update.fraction,
+                    ))
+                    .child(
+                        text(format!("{:.0}%", update.fraction * 100.0))
+                            .font(type_::LABEL)
+                            .color(p.t.text_secondary),
+                    ),
+            );
+        }
+    }
+
     line = line.child(text_column);
 
-    if let Some(label) = item.action.label() {
+    if let Some(kind) = kind {
+        line = line.child(model_controls(state, p, kind));
+    } else if let Some(label) = item.action.label() {
         let action = item.action;
         let key = format!("setup-action-{}", item.key());
         line = line.child(secondary_button(p, &key, label, true, move |state| {
@@ -690,6 +748,101 @@ fn setup_row(p: Paint, item: &SetupItem) -> El {
     }
 
     line
+}
+
+fn model_status(phase: ModelPhase) -> SetupStatus {
+    match phase {
+        ModelPhase::Missing => SetupStatus::Missing,
+        ModelPhase::Installed | ModelPhase::Ready => SetupStatus::Ready,
+        ModelPhase::Downloading | ModelPhase::Verifying | ModelPhase::Loading => {
+            SetupStatus::Checking
+        }
+        ModelPhase::Error => SetupStatus::Incomplete,
+        ModelPhase::Cancelled => SetupStatus::Warning,
+    }
+}
+
+fn model_controls(state: &Jarvis, p: Paint, kind: ModelKind) -> El {
+    let update = state.models.get(kind);
+    let key = kind.key();
+    let mut controls = row().gap(6.0).center_y();
+
+    match update.phase {
+        ModelPhase::Missing => {
+            let download_key = format!("download-{key}-model");
+            controls = controls.child(secondary_button(
+                p,
+                &download_key,
+                "Download",
+                true,
+                move |state| state.install_model(kind),
+            ));
+        }
+        ModelPhase::Installed => {
+            let load_key = format!("load-{key}-model");
+            controls = controls.child(secondary_button(p, &load_key, "Load", true, move |state| {
+                state.load_model(kind)
+            }));
+        }
+        ModelPhase::Downloading | ModelPhase::Verifying | ModelPhase::Loading => {
+            let cancel_key = format!("cancel-{key}-model");
+            controls = controls.child(link_button(p, &cancel_key, "Cancel", move |state| {
+                state.cancel_model(kind)
+            }));
+        }
+        ModelPhase::Ready => {
+            if let Some(backend) = &update.backend {
+                controls = controls.child(
+                    row()
+                        .h(20.0)
+                        .px(7.0)
+                        .radius(10.0)
+                        .center()
+                        .fill(p.accent.alpha(0.12))
+                        .child(
+                            text(format!("Loaded · {backend}"))
+                                .font(type_::LABEL)
+                                .color(p.accent),
+                        ),
+                );
+            }
+            let load_key = format!("load-{key}-model");
+            controls = controls.child(secondary_button(
+                p,
+                &load_key,
+                "Load again",
+                true,
+                move |state| state.load_model(kind),
+            ));
+        }
+        ModelPhase::Error => {
+            let retry_key = format!("download-{key}-model");
+            let load_key = format!("load-{key}-model");
+            controls = controls
+                .child(secondary_button(
+                    p,
+                    &retry_key,
+                    "Retry",
+                    true,
+                    move |state| state.install_model(kind),
+                ))
+                .child(secondary_button(p, &load_key, "Load", true, move |state| {
+                    state.load_model(kind)
+                }));
+        }
+        ModelPhase::Cancelled => {
+            let resume_key = format!("download-{key}-model");
+            controls = controls.child(secondary_button(
+                p,
+                &resume_key,
+                "Resume",
+                true,
+                move |state| state.install_model(kind),
+            ));
+        }
+    }
+
+    controls
 }
 
 fn setup_finish(state: &Jarvis, p: Paint) -> El {
@@ -921,7 +1074,7 @@ fn about_page(state: &Jarvis, p: Paint) -> El {
                 .child(section_heading(p, "About"))
                 .child(info_row(p, "Application", "Jarvis for Windows"))
                 .child(info_row(p, "Version", state.version))
-                .child(info_row(p, "Build", "Phase 1 · first-run setup"))
+                .child(info_row(p, "Build", "Phase 2 · model manager"))
                 .child(info_row(p, "Platform", std::env::consts::OS))
                 .child(info_row(
                     p,
@@ -983,7 +1136,7 @@ fn placeholder_page(section: Section, p: Paint) -> El {
         .child(
             card(p, "placeholder-card")
                 .child(
-                    text("This screen arrives in a later build. Phase 1 ships the app shell, first-run setup and Windows system checks.")
+                    text("This screen arrives in a later build. Phase 2 ships the app shell, setup, verified model downloads and runtime warm-up.")
                         .font(type_::BODY)
                         .color(p.t.text_secondary),
                 )
@@ -1157,6 +1310,7 @@ fn danger_color() -> Color {
 mod tests {
     use super::*;
     use jarvis_core::setup::{SetupAction, SetupReport};
+    use jarvis_models::manager::ModelUpdate;
     use rune::{Env, Runtime};
 
     fn runtime() -> Runtime<Jarvis> {
@@ -1186,6 +1340,41 @@ mod tests {
         assert!(runtime.find("setup-row-intent-model").is_some());
         assert!(runtime.find("setup-row-gpu").is_some());
         assert!(runtime.find("setup-row-ollama").is_some());
+        assert!(runtime.find("download-speech-model").is_some());
+        assert!(runtime.find("download-intent-model").is_some());
+    }
+
+    #[test]
+    fn a_download_shows_progress_and_cancel() {
+        let mut state = Jarvis::for_test();
+        state.models.speech = ModelUpdate::new(
+            ModelKind::Speech,
+            ModelPhase::Downloading,
+            "742 MB of 1.5 GB",
+        )
+        .with_fraction(0.48);
+        let mut runtime = Runtime::new(state, view, (1120.0, 760.0), Env::new(true, 1.0));
+        runtime.frame(0.0);
+
+        assert!(runtime.find("model-progress-speech").is_some());
+        assert!(runtime.find("cancel-speech-model").is_some());
+        assert!(runtime.find("download-speech-model").is_none());
+    }
+
+    #[test]
+    fn a_ready_model_offers_reloading_and_shows_its_backend() {
+        let mut state = Jarvis::for_test();
+        state.models.speech = ModelUpdate::new(
+            ModelKind::Speech,
+            ModelPhase::Ready,
+            "Whisper loaded on vulkan and passed a silent warm-up.",
+        )
+        .with_backend("vulkan");
+        let mut runtime = Runtime::new(state, view, (1120.0, 760.0), Env::new(true, 1.0));
+        runtime.frame(0.0);
+
+        assert!(runtime.find("load-speech-model").is_some());
+        assert!(runtime.find("model-progress-speech").is_none());
     }
 
     #[test]

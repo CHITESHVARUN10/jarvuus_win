@@ -46,8 +46,28 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Tests
-        run: cargo test --workspace --all-targets
-
+      # The build downloads ort's pinned DirectML ONNX Runtime distribution.
+      # Linking it first catches missing Windows SDK pieces before tests.
       - name: Build
         run: cargo build --workspace
+
+      # Windows test executables live in target\debug\deps. ort copies
+      # DirectML.dll to the target directory, but symlink creation can fail
+      # without Developer Mode, so place the DLL beside the test binaries.
+      - name: Prepare DirectML runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path "$env:LOCALAPPDATA\ort.pyke.io" -Recurse -Filter DirectML.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dll) {
+            Write-Error "DirectML.dll was not downloaded by the ort build"
+            exit 1
+          }
+          Copy-Item $dll.FullName "target\debug\DirectML.dll" -Force
+          New-Item -ItemType Directory -Force -Path "target\debug\deps" | Out-Null
+          Copy-Item $dll.FullName "target\debug\deps\DirectML.dll" -Force
+          New-Item -ItemType Directory -Force -Path "target\debug\examples" | Out-Null
+          Copy-Item $dll.FullName "target\debug\examples\DirectML.dll" -Force
+
+      - name: Tests
+        run: cargo test --workspace --all-targets

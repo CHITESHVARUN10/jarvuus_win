@@ -197,6 +197,22 @@ impl SetupReport {
         self.items.iter().find(|item| item.kind == kind)
     }
 
+    pub fn update_item(&mut self, kind: SetupKind, status: SetupStatus, detail: impl Into<String>) {
+        if let Some(item) = self.items.iter_mut().find(|item| item.kind == kind) {
+            item.status = status;
+            item.detail = detail.into();
+        }
+        self.recompute_essentials();
+    }
+
+    fn recompute_essentials(&mut self) {
+        self.essentials_ready = self
+            .items
+            .iter()
+            .filter(|item| item.kind.is_essential() && item.is_ready())
+            .count();
+    }
+
     pub fn run(paths: &AppPaths, probe: &impl SystemProbe) -> Self {
         let mic = probe.microphone();
         let gpu = probe.gpu();
@@ -444,6 +460,20 @@ mod tests {
             .unwrap()
             .detail
             .contains("Vulkan"));
+    }
+
+    #[test]
+    fn updating_items_recomputes_the_essentials_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut report = SetupReport::run(
+            &AppPaths::with_data_dir(dir.path()),
+            &probe(Consent::Allowed, GpuInfo::default()),
+        );
+        assert_eq!(report.essentials_ready, 1);
+        report.update_item(SetupKind::SpeechModel, SetupStatus::Ready, "installed");
+        assert_eq!(report.essentials_ready, 2);
+        report.update_item(SetupKind::SpeechModel, SetupStatus::Missing, "removed");
+        assert_eq!(report.essentials_ready, 1);
     }
 
     #[test]

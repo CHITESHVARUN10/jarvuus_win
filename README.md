@@ -8,13 +8,19 @@ The macOS project is cloned into `jarvuss/` for reference and is ignored by git.
 
 ## Status
 
-**Phase 1 complete: first-run setup and the native app shell.**
+**Phase 2 complete: verified model management and runtime warm-up.**
 
 - Rune (native GPU-rendered Rust UI) application window with navigation.
-- First-run setup screen with essentials progress, status chips and per-item fixes.
-- Windows microphone privacy probe and a deep link to Windows settings.
-- GPU inventory probe (native DXGI) with Vulkan/DirectML capability messaging.
-- Whisper and intent model presence checks against the managed data layout.
+- First-run setup with essentials progress, status chips and per-item fixes.
+- Windows microphone privacy probe, DXGI GPU inventory and a settings deep link.
+- Speech model downloads with resumable 8 MiB range requests, `.part` recovery,
+  quarantine of invalid files and full size/ggml/SHA-256 verification.
+- Intent releases resolved from the pinned Hugging Face commit, validated against
+  the release manifest, downloaded with per-file checksums, and activated as
+  immutable version directories with `current.json` / `last-good.json`.
+- Warm-up loading for both models: Whisper on a dedicated worker, DirectML-first
+  ONNX Runtime on Windows, and CPU fallback for both.
+- Download progress, speed/ETA, cancel/resume and Load/Retry controls in Setup.
 - Optional Ollama probe with a short localhost timeout.
 - Persisted settings (theme, accent, setup completion) with atomic writes.
 - Timestamped command log under the data directory.
@@ -25,12 +31,14 @@ The macOS project is cloned into `jarvuss/` for reference and is ignored by git.
 
 ![First-run setup](docs/screenshots/setup.png)
 
+![Speech model download](docs/screenshots/models.png)
+
 ![Assistant](docs/screenshots/assistant.png)
 
 ![Appearance](docs/screenshots/appearance.png)
 
-The setup screenshot uses demo statuses so all rows are visible; the real app
-fills them from the Windows probes at launch.
+The setup screenshots use demo statuses so every state is visible; the real app
+fills them from the Windows probes and model downloads.
 
 ## Stack
 
@@ -39,30 +47,57 @@ fills them from the Windows probes at launch.
 | Interface | [Rune](https://github.com/anomalyco/rune), pinned by revision |
 | Speech to text | whisper.cpp via `whisper-rs`, `ggml-large-v3-turbo` |
 | Intent | fine-tuned t5-small, int8 ONNX from [Hugging Face](https://huggingface.co/chitesh12545/jarvis-intent-t5-small) |
-| Speech acceleration | Vulkan by default (NVIDIA, AMD, Intel iGPUs), optional CUDA build, CPU fallback |
-| Intent acceleration | ONNX Runtime DirectML, optional CUDA build, CPU fallback |
+| Speech acceleration | Vulkan feature build (NVIDIA, AMD, Intel iGPUs), CPU fallback |
+| Intent acceleration | DirectML by default on Windows, CPU fallback |
 | Local answers | Ollama, optional |
 | Runtime | Rust only; Python stays in training tooling |
 
 ## Build
 
 Windows prerequisites: Rust 1.97+, the MSVC build tools (the default
-`x86_64-pc-windows-msvc` toolchain), and CMake. GPU builds of whisper.cpp will
-also need the Vulkan SDK (`glslc`); the CPU path does not.
+`x86_64-pc-windows-msvc` toolchain), CMake, and LLVM/libclang for the native
+model bindings.
 
 ```powershell
 cargo run -p jarvis-app
 cargo test --workspace
 ```
 
+The default build is CPU for speech. Build the GPU speech path with Vulkan (this
+also needs the Vulkan SDK, including `glslc`):
+
+```powershell
+cargo build --release -p jarvis-app --features gpu-vulkan
+```
+
+The intent runtime is self-contained on Windows: `ort` downloads its pinned,
+DirectML-enabled ONNX Runtime distribution at build time and links it into the
+binary. The engine tries DirectML first and falls back to CPU automatically.
+
+If Windows cannot create symlinks (Developer Mode is off), the build places
+`DirectML.dll` only in `target\debug`; copy it to `target\debug\deps` before
+running tests. CI does this automatically.
+
 On macOS the UI preview runs with the same command. Microphone and GPU probes
 report that they are Windows-only, and the app uses `JarvisWindows` as its data
-directory so it never touches a real macOS Jarvis install.
+directory so it never touches a real macOS Jarvis install. Real intent warm-up on
+macOS needs an ONNX Runtime dylib via `JARVIS_ORT_DYLIB`.
+
+Live model checks download the real releases and are not part of CI:
+
+```powershell
+# Intent (206 MB). On macOS set JARVIS_ORT_DYLIB to an ONNX Runtime 1.31 dylib.
+cargo test -p jarvis-models --test live_intent -- --ignored --nocapture
+
+# Speech (1.6 GB).
+cargo test -p jarvis-models --test live_speech -- --ignored --nocapture
+```
 
 Headless renders for UI review (debug builds include Rune's tooling):
 
 ```powershell
 cargo run -p jarvis-app -- --snap setup.png --scene setup
+cargo run -p jarvis-app -- --snap downloading.png --scene downloading
 cargo run -p jarvis-app -- --snap ready.png --scene ready
 cargo run -p jarvis-app -- --snap appearance.png --scene appearance
 ```
@@ -77,9 +112,11 @@ On Windows everything lives under `%LOCALAPPDATA%\Jarvis`:
   logs\commands.log                 timestamped app and setup log
   models\
     ggml-large-v3-turbo.bin         speech model (about 1.5 GB)
-    intent\                         managed intent releases
+    ggml-large-v3-turbo.bin.part    resumable partial download
+    intent\
       current.json                  active release receipt
-      last-good.json                last warmed release (phase 2)
+      last-good.json                last successfully warmed release
+      download-<commit>\            resumable staging for a release
       versions\<commit>-<nonce>\    immutable model files + manifest
 ```
 
@@ -93,21 +130,32 @@ exactly 1,624,555,275 bytes and SHA-256
 `1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69`.
 
 Intent: `chitesh12545/jarvis-intent-t5-small`, exported as int8 ONNX
-(`encoder_model_quantized.onnx` + `decoder_model_merged_quantized.onnx`),
-installed through the same commit-pinned, receipt-checked layout as the macOS
-app.
+(`encoder_model_quantized.onnx` + `decoder_model_merged_quantized.onnx`).
 
-Phase 1 only reports presence. Phase 2 adds downloads, resume, checksum
-verification, atomic activation, warm-up validation and GPU provider selection.
+Download behaviour:
+
+- The speech model resumes from the actual partial size, validates
+  `Content-Range`, restarts safely if a server ignores `Range`, and only
+  publishes the file after size, ggml header and SHA-256 checks pass.
+- The intent model pins `main` to a commit once, verifies the release manifest,
+  requires the expected files and license notices, and checks every file before
+  atomically activating a `versions\<commit>-<nonce>` directory.
+- Cancelling keeps the partial/staging files for a later resume.
+- A release that fails validation never replaces a working install; a locally
+  newer version is kept instead of being downgraded.
+- After a successful download the model is loaded and warmed up. Whisper decodes
+  one second of silence; the intent model must return a valid plan for `pause`.
+- DirectML is attempted first on Windows for intent; Vulkan is attempted first
+  for speech when the `gpu-vulkan` feature is compiled in. Both fall back to CPU.
 
 ## Phases
 
 | Phase | Scope | Status |
 | --- | --- | --- |
 | 1 | Workspace, Rune shell, first-run setup, Windows permission/GPU probes, CI | Done |
-| 2 | Model manager: intent + speech download, resume, verify, activate, warm up, GPU providers | Next |
-| 3 | Audio capture, VAD, Whisper transcription, dictation hotkey, text insertion | Planned |
-| 4 | Intent inference, command planner/actions, Windows app/URL/volume/media/files/settings | Planned |
+| 2 | Model manager: download, resume, verify, activate, warm up, GPU providers | Done |
+| 3 | Audio capture, VAD, Whisper transcription, dictation hotkey, text insertion | Next |
+| 4 | Command planner/actions, Windows app/URL/volume/media/files/settings | Planned |
 | 5 | Routines, insights, tray, startup, hotkey settings, UI parity | Planned |
 | 6 | Packaging (MSIX/NSIS), release artifacts, performance hardening | Planned |
 
