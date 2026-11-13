@@ -1,0 +1,16 @@
+# Reference clone of the macOS project (read-only reference)
+/jarvuss/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Build output
+/target/
+/dist/
+/build/
