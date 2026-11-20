@@ -8,7 +8,7 @@ The macOS project is cloned into `jarvuss/` for reference and is ignored by git.
 
 ## Status
 
-**Phase 5 complete: routines, insights, tray, startup and configurable hotkeys.**
+**Phase 6 complete: Windows packaging, release artifacts and performance hardening.**
 
 - Rune (native GPU-rendered Rust UI) application window with navigation.
 - First-run setup with essentials progress, status chips and per-item fixes.
@@ -49,9 +49,14 @@ The macOS project is cloned into `jarvuss/` for reference and is ignored by git.
   hotkeys recorded from a chord.
 - Persisted settings (theme, accent, setup, hotkeys, startup, tray) with atomic
   writes.
-- Timestamped command log under the data directory.
+- Per-user NSIS installer, portable zip and MSIX package built from one release
+  executable, with SHA-256 checksums.
+- Release workflow on `v*` tags that builds and uploads all Windows artifacts.
+- Fat-LTO release profile, a 4 MiB rotating command log, bounded command history
+  and the existing model idle unload.
 - Cross-platform dev preview: the same app runs on macOS for UI work.
-- GitHub Actions on Windows and macOS: formatting, clippy, tests, build.
+- GitHub Actions on Windows and macOS: formatting, clippy, tests, build; a
+  tag-driven Windows release workflow.
 
 ## UI
 
@@ -85,6 +90,7 @@ planner and model workers.
 | Routines and insights | local JSON stores, planner replay, local aggregation |
 | Tray and startup | Rune `Shell_NotifyIcon` tray, `HKCU\...\Run` |
 | Hotkeys and paste | Win32 `RegisterHotKey` + clipboard/`SendInput` |
+| Packaging | NSIS, MakeAppx/MSIX, portable zip, SHA-256 release artifacts |
 | Intent | fine-tuned t5-small, int8 ONNX from [Hugging Face](https://huggingface.co/chitesh12545/jarvis-intent-t5-small) |
 | Speech acceleration | Vulkan feature build (NVIDIA, AMD, Intel iGPUs), CPU fallback |
 | Intent acceleration | DirectML by default on Windows, CPU fallback |
@@ -115,7 +121,35 @@ binary. The engine tries DirectML first and falls back to CPU automatically.
 
 If Windows cannot create symlinks (Developer Mode is off), the build places
 `DirectML.dll` only in `target\debug`; copy it to `target\debug\deps` before
-running tests. CI does this automatically.
+running tests. CI does this automatically. Packaging puts `DirectML.dll` beside
+the executable when it can find it; without it the intent engine falls back to
+CPU.
+
+## Release artifacts
+
+Windows packaging needs NSIS and the Windows SDK:
+
+```powershell
+choco install nsis -y
+pwsh packaging/windows/build.ps1 -Version 0.1.0
+```
+
+The script writes `dist\` with:
+
+- `Jarvis-<version>-x64-setup.exe` — per-user NSIS installer.
+- `Jarvis-<version>-x64-portable.zip` — `jarvis.exe` plus `DirectML.dll`.
+- `Jarvis-<version>-x64.msix` — full-trust MSIX package.
+- `SHA256SUMS.txt`.
+
+The installer writes to `%LOCALAPPDATA%\Programs\Jarvis`, adds Start menu and
+optional desktop shortcuts, and asks before deleting user data during uninstall.
+The target machine needs the Microsoft Visual C++ 2015–2022 Redistributable
+(x64); the installer warns if `vcruntime140.dll` is missing. The MSIX is unsigned
+by default; see
+[packaging/windows/README.md](packaging/windows/README.md) for sideloading and
+signing. Pushing a `v*` tag runs `.github/workflows/release.yml`, which repeats
+the build and uploads these files to a GitHub release. Bump the workspace
+`Cargo.toml` version before tagging; the packaging script rejects a mismatch.
 
 On macOS the UI preview runs with the same command. Microphone and GPU probes
 report that they are Windows-only, and the app uses `JarvisWindows` as its data
@@ -159,6 +193,7 @@ On Windows everything lives under `%LOCALAPPDATA%\Jarvis`:
   routines.json                     saved named commands
   insights.json                     local command totals and daily buckets
   logs\commands.log                 timestamped app and setup log
+  logs\commands.log.1               previous log after the 4 MiB rotation
   models\
     ggml-large-v3-turbo.bin         speech model (about 1.5 GB)
     ggml-large-v3-turbo.bin.part    resumable partial download
@@ -290,6 +325,19 @@ Local), and a daily bucket. The page shows totals, success rate, a seven-day
 chart and the branch split. History is capped at 90 days in `insights.json`; no
 command text, audio or model request is stored or sent anywhere.
 
+## Performance bounds
+
+- The release profile uses fat LTO, one codegen unit, `opt-level = 3` and symbol
+  stripping. Artifacts are built by the release workflow, not on every check.
+- Command history keeps the ten newest results; older file action data is
+  dropped with them.
+- The command/setup log rotates to `commands.log.1` at 4 MiB, so continuous
+  command logging cannot grow without bound.
+- Insight history is capped at 90 days; routines at 50 entries.
+- The intent engine unloads after 300 s idle; Whisper has its own idle unload.
+- The UI is event-driven: the tray and background workers wake Rune through its
+  waker instead of polling.
+
 ## Tray, startup and hotkeys
 
 On Windows the app keeps a tray icon with Open Jarvis, Dictate, Command, Settings
@@ -316,7 +364,8 @@ and a failed registration leaves the old one working. Defaults are
 | 3 | Audio capture, VAD, Whisper transcription, dictation hotkey, text insertion | Done |
 | 4 | Command planner/actions, Windows app/URL/volume/media/files/settings | Done |
 | 5 | Routines, insights, tray, startup, hotkey settings, UI parity | Done |
-| 6 | Packaging (MSIX/NSIS), release artifacts, performance hardening | Next |
+| 6 | Packaging (MSIX/NSIS), release artifacts, performance hardening | Done |
+| 7 | Code signing, auto-update, signed MSIX distribution | Planned |
 
 Architecture and porting notes: [ARCHITECTURE.md](ARCHITECTURE.md).
 

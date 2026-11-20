@@ -15,6 +15,7 @@ use rune::TextEdit;
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
 const INTENT_CONFIDENCE_THRESHOLD: f64 = 0.75;
+const MAX_COMMAND_RECORDS: usize = 10;
 
 #[derive(Clone, Debug, Default)]
 pub struct CommandRecord {
@@ -69,7 +70,7 @@ impl CommandUi {
                 self.status.clear();
                 self.active_input.clear();
                 self.records.insert(0, record);
-                self.records.truncate(10);
+                self.records.truncate(MAX_COMMAND_RECORDS);
             }
         }
         true
@@ -428,5 +429,23 @@ mod tests {
         assert!(!ui.busy);
         assert_eq!(ui.records.len(), 1);
         assert_eq!(ui.records[0].source, "Rules");
+    }
+
+    #[test]
+    fn command_history_is_bounded() {
+        let mut ui = CommandUi::new();
+        for index in 0..MAX_COMMAND_RECORDS + 5 {
+            ui.apply(CommandEvent::Done {
+                record: CommandRecord {
+                    input: format!("command {index}"),
+                    source: "Rules".into(),
+                    ok: true,
+                    ..CommandRecord::default()
+                },
+            });
+        }
+        assert_eq!(ui.records.len(), MAX_COMMAND_RECORDS);
+        assert_eq!(ui.records[0].input, "command 14");
+        assert_eq!(ui.records[MAX_COMMAND_RECORDS - 1].input, "command 5");
     }
 }

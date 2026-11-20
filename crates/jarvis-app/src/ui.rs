@@ -319,7 +319,7 @@ fn sidebar_footer(state: &Jarvis, p: Paint) -> El {
                 .justify_between()
                 .gap(10.0)
                 .child(
-                    text(format!("v{} · phase 5", state.version))
+                    text(format!("v{} · phase 6", state.version))
                         .font(TextStyle::new(11.0, 500.0))
                         .color(p.t.text_secondary),
                 )
@@ -1804,7 +1804,7 @@ fn about_page(state: &Jarvis, p: Paint) -> El {
                 .child(section_heading(p, "About"))
                 .child(info_row(p, "Application", "Jarvis for Windows"))
                 .child(info_row(p, "Version", state.version))
-                .child(info_row(p, "Build", "Phase 5 · routines & insights"))
+                .child(info_row(p, "Build", "Phase 6 · packaged release"))
                 .child(info_row(p, "Platform", std::env::consts::OS))
                 .child(info_row(
                     p,

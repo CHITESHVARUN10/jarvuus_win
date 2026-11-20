@@ -18,6 +18,9 @@ path = "src/main.rs"
 default = []
 gpu-vulkan = ["jarvis-models/gpu-vulkan"]
 
+[build-dependencies]
+winresource = "0.1"
+
 [dependencies]
 jarvis-core = { path = "../jarvis-core" }
 jarvis-platform = { path = "../jarvis-platform" }

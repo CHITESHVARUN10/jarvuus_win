@@ -137,7 +137,8 @@ and `-1743` handling have no Windows equivalent and are not ported.
 | `settings.json` | Theme, accent, setup completion, hotkeys, startup, tray |
 | `routines.json` | Named compound commands |
 | `insights.json` | Command totals, branch counts and daily buckets |
-| `logs/commands.log` | Append-only app/setup log |
+| `logs/commands.log` | Append-only app/setup log, rotated at 4 MiB |
+| `logs/commands.log.1` | Previous log after rotation |
 | `models/ggml-large-v3-turbo.bin` | Whisper model |
 | `models/ggml-large-v3-turbo.bin.part` | Resumable speech download |
 | `models/intent/current.json` | Active managed intent release |
@@ -362,6 +363,49 @@ Windows equivalent.
 **Deferred.** Silent-background login launch, per-routine voice triggers, insights
 export/upload and a floating dictation pill.
 
+## Release pipeline and performance bounds
+
+The release executable is `jarvis.exe`, built with a fat-LTO, single-codegen-unit
+profile and stripped symbols. `crates/jarvis-app/build.rs` embeds the generated
+icon and version metadata through `winresource` on Windows.
+
+`packaging/windows/build.ps1` produces one set of artifacts from that executable:
+
+1. Copies the executable and `DirectML.dll` (when found) into a portable folder
+   and zips it.
+2. Compiles `packaging/nsis/jarvis.nsi` into a per-user installer. It installs
+   under `%LOCALAPPDATA%\Programs\Jarvis`, writes Start menu/optional desktop
+   shortcuts and the per-user uninstall entry, stops a running copy before
+   replacing files, and asks before deleting `%LOCALAPPDATA%\Jarvis` on uninstall.
+   The installer removes the launch-at-login Run value.
+3. Stages `packaging/msix/` and runs MakeAppx for a full-trust MSIX package. The
+   manifest uses `runFullTrust`, a `Windows.FullTrustApplication` entry point and
+   `jarvis.exe` execution alias. It is unsigned by default and the Publisher must
+   match the signing certificate when one is added.
+4. Writes `SHA256SUMS.txt` for the portable zip, installer and MSIX.
+
+The script checks that the requested version matches the workspace `Cargo.toml`
+version, so a `v*` tag and the app metadata cannot silently diverge. The release
+workflow (`.github/workflows/release.yml`) installs NSIS, builds and tests the
+release target, runs the packaging script and uploads everything to a GitHub
+release. Packaging assets are generated reproducibly by
+`packaging/windows/make_assets.py`.
+
+Performance hardening is bounded storage rather than a new scheduler:
+
+- The command log rotates to `commands.log.1` at 4 MiB under a process-wide lock,
+  so logging from the UI, command, speech and setup threads cannot grow without
+  bound or race the rename.
+- The command result history keeps the ten newest records, including their file
+  action data.
+- Routines are capped at 50 and insights at 90 days.
+- The intent engine still unloads after 300 s idle and Whisper has its own idle
+  unload. The UI/tray path is event-driven through the Rune waker rather than
+  polling.
+
+Code signing, signed MSIX distribution and auto-update remain Phase 7. The
+current release artifacts are unsigned.
+
 ## CI
 
 `.github/workflows/ci.yml` runs on Windows and macOS:
@@ -390,6 +434,11 @@ ort's pinned DirectML distribution and links it, so the Windows CI build also
 proves the DirectML link path. Model weights are never downloaded in CI: the
 network, resume, manifest and activation tests use a local HTTP server with tiny
 fixtures.
+
+`.github/workflows/release.yml` runs on `v*` tags (and manually with a version
+input). It repeats the Windows build/test preparation, then runs the packaging
+script and publishes the portable zip, installer, MSIX and checksums through a
+GitHub release. It does not sign the artifacts.
 
 ## Vendored Rune crates
 
