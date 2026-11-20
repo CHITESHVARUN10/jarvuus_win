@@ -8,7 +8,7 @@ The macOS project is cloned into `jarvuss/` for reference and is ignored by git.
 
 ## Status
 
-**Phase 3 complete: local dictation.**
+**Phase 4 complete: local command routing and Windows actions.**
 
 - Rune (native GPU-rendered Rust UI) application window with navigation.
 - First-run setup with essentials progress, status chips and per-item fixes.
@@ -30,7 +30,16 @@ The macOS project is cloned into `jarvuss/` for reference and is ignored by git.
   and transcript Copy.
 - Automatic paste at the cursor with clipboard snapshot/restore; elevated windows
   that block synthetic input fall back to leaving the transcript on the clipboard.
-- Optional Ollama probe with a short localhost timeout.
+- Assistant command bar and global `Ctrl+Shift+A` command dictation.
+- Deterministic command planner ported from the macOS rust-core, with Windows app,
+  settings, folder, file and safety policy.
+- Local learned intent engine for unknown non-questions: DirectML first, CPU
+  fallback, strict JSON action mapping and 300 s idle unload.
+- Optional Ollama planner/answer fallback with a short localhost timeout.
+- Windows actions for apps, URLs/search, volume, media transport, settings panes,
+  folders, file creation/search/open/reveal, time/date/battery/WiFi/volume.
+- Pre-execution safety: destructive/elevated commands blocked, installs previewed,
+  protected system paths denied, app-close allowlist and http(s)-only links.
 - Persisted settings (theme, accent, setup completion) with atomic writes.
 - Timestamped command log under the data directory.
 - Cross-platform dev preview: the same app runs on macOS for UI work.
@@ -48,8 +57,9 @@ The macOS project is cloned into `jarvuss/` for reference and is ignored by git.
 
 ![Appearance](docs/screenshots/appearance.png)
 
-The screenshots use demo statuses and a demo transcript; the real app fills them
-from the Windows probes, microphone and model worker.
+The screenshots use demo statuses, a demo transcript and a demo command result;
+the real app fills them from the Windows probes, microphone, command planner and
+model workers.
 
 ## Stack
 
@@ -58,7 +68,9 @@ from the Windows probes, microphone and model worker.
 | Interface | [Rune](https://github.com/anomalyco/rune), pinned by revision |
 | Speech to text | whisper.cpp via `whisper-rs`, `ggml-large-v3-turbo` |
 | Dictation | cpal/WASAPI, 16 kHz mono, VAD, 6 s chunks with 1 s overlap |
-| Hotkey and paste | Win32 `RegisterHotKey` + clipboard/`SendInput` |
+| Commands | Ported deterministic planner + t5 intent + optional Ollama |
+| Windows actions | `ShellExecute`, WASAPI volume, media keys, `ms-settings`, file search |
+| Hotkeys and paste | Win32 `RegisterHotKey` + clipboard/`SendInput` |
 | Intent | fine-tuned t5-small, int8 ONNX from [Hugging Face](https://huggingface.co/chitesh12545/jarvis-intent-t5-small) |
 | Speech acceleration | Vulkan feature build (NVIDIA, AMD, Intel iGPUs), CPU fallback |
 | Intent acceleration | DirectML by default on Windows, CPU fallback |
@@ -99,7 +111,8 @@ macOS needs an ONNX Runtime dylib via `JARVIS_ORT_DYLIB`.
 Live checks download real models or use the microphone and are not part of CI:
 
 ```powershell
-# Intent (206 MB). On macOS set JARVIS_ORT_DYLIB to an ONNX Runtime 1.31 dylib.
+# Intent (206 MB): install, warm-up, then check "open chrome" -> app.open.
+# On macOS set JARVIS_ORT_DYLIB to an ONNX Runtime 1.31 dylib.
 cargo test -p jarvis-models --test live_intent -- --ignored --nocapture
 
 # Speech (1.6 GB).
@@ -188,6 +201,59 @@ Voice page's Start/Stop buttons. The window does not need focus.
 Limitations in this phase: the hotkey is fixed; clipboard restore preserves text
 only; there is no floating dictation pill or tray overlay yet (Phase 5).
 
+## Commands
+
+Type a command in the Assistant bar or press `Ctrl+Shift+A`, speak, and press it
+again. The command hotkey needs the speech model; typed commands work without it.
+No window focus is required, so commands can be spoken while another app is
+active.
+
+Routing is deliberately local-first:
+
+1. Clean and validate the utterance; run the safety checks.
+2. Use deterministic rules for common apps, volume, media transport, info, URLs,
+   searches, settings pages, folders and files.
+3. For unknown non-questions, ask the local t5 intent model and strictly map its
+   JSON action list; plans below 0.75 confidence fall through.
+4. If nothing local decides it, ask Ollama to plan; if it returns an answer rather
+   than an action, show that answer.
+
+The result card names the branch that decided it: `Rules`, `Intent model` or
+`Ollama`.
+
+Supported now:
+
+- Open known apps and close most of them (Chrome, Edge, Firefox, Brave, Arc,
+  Spotify, WhatsApp, VS Code, Windows Terminal, File Explorer, Notepad, Calculator,
+  Settings, Paint, Task Manager, GitHub Desktop). Explorer and command prompts are
+  protected from close.
+- Open http(s) URLs, open a URL in a named browser, Google/YouTube searches, and
+  Windows settings pages by name.
+- Volume set/increase/decrease, mute/unmute, and media play/pause/next/previous
+  through the Windows media keys.
+- Open known folders; create a file or folder in Documents (never overwrite);
+  count/list/newest/oldest/largest/total-size file queries; search by name or
+  content; open or reveal results in Explorer.
+- Time, date, day, month, year, battery, Wi-Fi, and current volume.
+
+Deferred to later phases:
+
+- Display brightness/contrast/resolution.
+- Playing a named song or playlist, liked songs, and shuffle control.
+- Opening a project workspace by name.
+- Installing apps.
+
+Safety: destructive and elevated commands are blocked; install commands are
+preview-only and disabled; protected Windows paths are denied; app close uses a
+known-image allowlist; links are http(s)-only; file creation cannot escape
+Documents and cannot overwrite.
+
+The intent model loads lazily on the first unknown non-question, tries DirectML
+and falls back to CPU, and is unloaded after 300 s idle. Ollama is optional; when
+it is running, the planner uses `qwen2.5:1.5b-instruct` with a 20 s planning
+timeout and a 30 s answer timeout. Without Ollama, unknown free-form questions
+return a clear local-only message instead of silence.
+
 ## Phases
 
 | Phase | Scope | Status |
@@ -195,8 +261,8 @@ only; there is no floating dictation pill or tray overlay yet (Phase 5).
 | 1 | Workspace, Rune shell, first-run setup, Windows permission/GPU probes, CI | Done |
 | 2 | Model manager: download, resume, verify, activate, warm up, GPU providers | Done |
 | 3 | Audio capture, VAD, Whisper transcription, dictation hotkey, text insertion | Done |
-| 4 | Command planner/actions, Windows app/URL/volume/media/files/settings | Next |
-| 5 | Routines, insights, tray, startup, hotkey settings, UI parity | Planned |
+| 4 | Command planner/actions, Windows app/URL/volume/media/files/settings | Done |
+| 5 | Routines, insights, tray, startup, hotkey settings, UI parity | Next |
 | 6 | Packaging (MSIX/NSIS), release artifacts, performance hardening | Planned |
 
 Architecture and porting notes: [ARCHITECTURE.md](ARCHITECTURE.md).

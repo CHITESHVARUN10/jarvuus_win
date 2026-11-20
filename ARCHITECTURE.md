@@ -10,7 +10,8 @@ the starting point.
 ```text
 crates/jarvis-app
   ├── crates/jarvis-core        OS-neutral paths, settings, setup model, logging
-  ├── crates/jarvis-platform    Windows probes, hotkey, clipboard insertion
+  ├── crates/jarvis-commands    deterministic planner, intent mapping, Ollama parser
+  ├── crates/jarvis-platform    Windows probes, executor, hotkeys, clipboard
   ├── crates/jarvis-speech      capture, VAD, chunking, dictation controller
   └── crates/jarvis-models      downloads, verified releases, warm-up engines
               └── jarvis-core
@@ -19,17 +20,24 @@ crates/jarvis-app
 - **jarvis-core** has no windowing or OS calls. It owns `AppPaths`,
   `AppSettings`, the setup report model, model file status, logging and the
   Ollama probe. All of it is unit-tested off Windows.
+- **jarvis-commands** is the portable command layer: clean/validate, safety,
+  fast-path and rule planning, strict intent-JSON mapping, URL/browser targets,
+  file-query interpretation and the Ollama tools prompt/parser. It has no window
+  or OS effects.
 - **jarvis-platform** owns Windows-specific behaviour behind `cfg(windows)` and
   exposes a small preview stub elsewhere so the UI can be developed on macOS.
+  Besides probes, hotkeys and clipboard insertion it executes planned actions:
+  `ShellExecute`, volume, media keys, `ms-settings`, app close and bounded file
+  search.
 - **jarvis-models** owns model storage, ranged downloads, Hugging Face release
   resolution, checksum verification, atomic activation, the whisper-rs and ONNX
   engines, and the thread-based `ModelManager`. It depends only on core.
 - **jarvis-speech** owns the cpal capture thread, resampling, VAD, chunking, the
   persistent Whisper worker, session epochs and the dictation lifecycle. It
   depends on core and the model crate's `WhisperEngine`.
-- **jarvis-app** owns the Rune view, navigation, first-run gating, the setup probe
-  and the model manager channel. The binary is a thin `main` that claims a
-  single-instance name and runs the app.
+- **jarvis-app** owns the Rune view, navigation, first-run gating, the setup probe,
+  the model/speech/command channels and the command worker. The worker owns the
+  lazy intent engine and executes actions off the UI thread.
 
 The app runs on macOS as a UI preview; Windows-only probes report a preview
 notice and the data directory is `JarvisWindows` to avoid touching a real macOS
@@ -47,14 +55,15 @@ main
             ├─ first run? Settings → Setup : Assistant
             └─ write launch line to logs/commands.log
        └─ first frame (setup rows show "Checking")
-       ├─ model manager, speech, hotkey and insertion channels
+       ├─ model manager, speech, command, hotkey and insertion channels
        └─ AppSpec::setup
-            ├─ store the Rune waker; attach model and dictation notifiers
-            ├─ register Ctrl+Shift+D (Windows)
+            ├─ store the Rune waker; attach model, dictation and command notifiers
+            ├─ register Ctrl+Shift+D and Ctrl+Shift+A (Windows)
             └─ spawn probe thread → SetupReport → wake
        └─ AppSpec::poll
             ├─ drain ModelUpdate events → setup rows, essentials, progress
             ├─ drain SpeechEvent, HotkeyEvent and insertion results
+            ├─ drain CommandEvent → result card, history, busy state
             └─ drain SetupReport → baseline setup status
 ```
 
@@ -103,8 +112,8 @@ Windows has no Accessibility or Automation grant equivalent to macOS.
   returning zero leaves the transcript on the clipboard and reports
   `ClipboardOnly` instead of pretending the paste worked.
 - **Global hotkeys.** `RegisterHotKey` needs no permission. `Ctrl+Shift+D`
-  (dictate) is registered on a dedicated message-loop thread with
-  `MOD_NOREPEAT`; `Ctrl+Shift+A` (command) arrives with Phase 4.
+  (dictate) and `Ctrl+Shift+A` (command) run on separate message-loop threads
+  with `MOD_NOREPEAT`; each registration has its own retry/status.
 - **Launch at login.** Planned `HKCU\...\Run` or MSIX startup task; the system
   remains the source of truth and is re-read after toggling.
 
@@ -141,8 +150,9 @@ same `Waker` used by the setup probe.
 The first frame starts from cheap on-disk states (`Missing`, `Installed`). A
 successful download warms the engine automatically; otherwise `Load` starts the
 warm-up. Warm-up engines are created and dropped on the worker thread, so the UI
-thread never owns a `WhisperContext` or an ONNX session. A persistent worker for
-live transcription arrives with Phase 3.
+thread never owns a `WhisperContext` or an ONNX session. Live transcription and
+command planning use their own persistent worker threads; the warm-up engine is
+only a verification pass.
 
 ### Intent model
 
@@ -245,24 +255,62 @@ The macOS Apple `SpeechAnalyzer` path and Porcupine wake word are not part of th
 Windows plan. Live listening is Whisper-only. A floating dictation pill, tray
 state and configurable hotkeys arrive with Phase 5.
 
-## Command plan (Phase 4)
+## Command pipeline (implemented)
 
-The macOS `rust-core` already contains most of the portable policy layer. Phase 4
-ports it and replaces the macOS effect layer:
+`jarvis-commands` is a direct port of the macOS `rust-core` policy modules:
+actions, validator, planner, command/settings/file policy, safety, intent mapping,
+workspace parsing, shuffle parsing, volume parsing and the Ollama tools prompt.
+Only the macOS app aliases, settings panes, protected paths and browser defaults
+were replaced with Windows equivalents.
 
-| Portable | Needs a Windows implementation |
-| --- | --- |
-| `actions`, `validator`, `planner`, `intent_mapper`, `command_policy` | App launch/close (`ShellExecute`, process/window close) |
-| `safety` (replace protected paths with `C:\Windows`, Program Files, ProgramData) | Volume (`IAudioEndpointVolume`) |
-| `workspace`, `local_search`, `shuffle`, `system_volume` parsing | Media (`GlobalSystemMediaTransportControlsSession`) |
-| Routine compilation and policy | Display brightness/contrast (WMI + DDC/CI) |
-| Ollama parsing and prompts | Settings deep links (`ms-settings:`), Explorer, Windows Search |
-| Cross-language fixture tests | Hotkeys and clipboard insertion |
+Routing, in order:
 
-Order of routing stays: native command → workspace/search → safety → rules →
-learned intent model → Ollama. The model is only asked for ambiguous or compound
-commands, and every failure path ends in a spoken/printed answer rather than
-silence.
+1. Clean and validate; reject garbage and trailing conjunctions.
+2. Safety: destructive/elevated commands are blocked, installs become a disabled
+   preview, and protected Windows paths are rejected.
+3. Fast path and deterministic rules: apps, close, URLs/search, settings,
+   volume, media transport, info, folders, create, and file queries.
+4. For an unknown non-question, the local t5 intent engine generates a strict JSON
+   action array. Plans below the 0.75 mean-token-probability threshold are
+   rejected. Unknown names or invalid args reject the whole plan; app names are
+   normalized through the alias resolver and every action is re-checked by the
+   safety validator.
+5. If nothing local decides it, Ollama is asked to plan. If it returns `ai_query`
+   / no usable plan, the same worker asks for a short answer instead.
+6. Actions execute sequentially on the command worker. The result card reports
+   the branch, plan, outcome messages and any file hits.
+
+The intent engine is the existing `IntentEngine` wrapper in `jarvis-models`. It
+loads the selected release (verified on disk), tries DirectML on Windows, falls
+back to CPU, exposes the raw generation and is dropped after 300 s with no
+command. The worker thread owns it, so loading and inference never block the UI.
+The generated JSON is mapped by `intent_mapper`, not executed blindly.
+
+Windows effects:
+
+- Apps use `ShellExecute`; close uses an image allowlist with `taskkill` (no
+  force). Explorer and command prompts are protected from close.
+- URLs and searches use `ShellExecute`; only validated http(s) links are allowed.
+- Volume uses `IAudioEndpointVolume` on the default render endpoint.
+- Media play/pause/next/previous use the Windows media keys through `SendInput`.
+- Settings panes map to `ms-settings:` URIs.
+- File work is bounded: recursive scan depth 8 and 20k entries, 20 results,
+  content search limited to 200 files / 2 MB each. Creation is limited to simple
+  names in Documents and never overwrites.
+- Time/date/day/month/year use local time; battery uses
+  `GetSystemPowerStatus`; Wi-Fi parses `netsh wlan show interfaces`; volume reads
+  the same endpoint.
+
+Deferred effects: display brightness/contrast/resolution, named song/playlist
+playback and shuffle, project-workspace opening by name, and app installation.
+The corresponding actions are parsed but return a clear "not available yet"
+message rather than pretending to succeed. The Ollama client is optional and
+uses `qwen2.5:1.5b-instruct` with a 20 s planning timeout and 30 s answer timeout;
+without Ollama, unknown free-form input gets a local-only explanation.
+
+The command hotkey starts the same dictation pipeline in command mode: the final
+Whisper transcript goes to the command worker instead of the clipboard/paste
+path. Typed commands use the same worker and result model.
 
 ## CI
 
@@ -281,7 +329,9 @@ run on a developer machine, not CI. CI has no microphone and never downloads the
 1.6 GB model.
 
 The headless Rune tests exercise the real view, click targets and state
-transitions, so the setup flow is covered without a display.
+transitions, so the setup, voice and command-result flows are covered without a
+display. Windows-target `cargo check`/clippy covers the Win32 executor on a macOS
+developer machine; the full link and behaviour run on Windows CI/developers.
 
 The model crate adds native build work: whisper.cpp (CMake), SentencePiece
 (static) and ONNX Runtime. Windows has no Vulkan SDK on the runner, so CI builds

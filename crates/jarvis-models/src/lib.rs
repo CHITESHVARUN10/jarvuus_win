@@ -7,6 +7,8 @@ pub mod manifest;
 pub mod speech;
 
 #[cfg(feature = "inference")]
+pub use engines::intent::{Generation, IntentEngine};
+#[cfg(feature = "inference")]
 pub use engines::whisper::WhisperEngine;
 
 use thiserror::Error;

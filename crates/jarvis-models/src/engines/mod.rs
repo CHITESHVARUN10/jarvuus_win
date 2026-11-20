@@ -9,7 +9,7 @@ pub struct Warmup {
 }
 
 #[cfg(feature = "inference")]
-mod intent;
+pub mod intent;
 #[cfg(feature = "inference")]
 mod runtime;
 #[cfg(feature = "inference")]

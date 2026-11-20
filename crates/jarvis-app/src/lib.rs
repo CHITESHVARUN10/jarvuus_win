@@ -1,7 +1,9 @@
 mod app;
+mod command;
 mod ui;
 
 pub use app::{Jarvis, Notice, NoticeTone, Section, SettingsPage};
+pub use command::{CommandRecord, CommandUi};
 
 use jarvis_models::manager::{ModelKind, ModelPhase, ModelUpdate};
 use jarvis_speech::DictationState;
@@ -48,6 +50,18 @@ const SCENES: &[Scene] = &[
         state.section = Section::Assistant;
         state.setup = Jarvis::demo_report(true);
         state.setup_running = false;
+        state.command.records.push(CommandRecord {
+            input: "open chrome and set volume to 30".into(),
+            source: "Rules".into(),
+            actions: vec!["Open 'Google Chrome'".into(), "Volume: set to 30%".into()],
+            messages: vec![
+                "Opened Google Chrome.".into(),
+                "Volume set to 30 percent.".into(),
+            ],
+            files: Vec::new(),
+            ok: true,
+        });
+        state.command.hotkey_error = None;
         state.models.speech = ModelUpdate::new(
             ModelKind::Speech,
             ModelPhase::Ready,

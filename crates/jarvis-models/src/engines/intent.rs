@@ -29,7 +29,53 @@ pub struct Generation {
     pub generated_ids: Vec<i64>,
 }
 
-pub struct Engine {
+pub struct IntentEngine {
+    engine: Engine,
+    backend: &'static str,
+    version: String,
+}
+
+impl IntentEngine {
+    pub fn load(paths: &AppPaths) -> Result<Self> {
+        let root = paths.intent_dir.clone();
+        let (folder, receipt) = intent_store::load_selection(&root)?;
+        let environment = runtime::environment(paths)?;
+
+        if cfg!(windows) {
+            if let Ok(engine) = Engine::load(&folder, environment, &providers(true), threads()) {
+                return Ok(Self {
+                    engine,
+                    backend: "directml",
+                    version: receipt.version,
+                });
+            }
+        }
+
+        let engine =
+            Engine::load(&folder, environment, &providers(false), threads()).map_err(|error| {
+                ModelError::message(format!("the intent model could not be loaded: {error}"))
+            })?;
+        Ok(Self {
+            engine,
+            backend: "cpu",
+            version: receipt.version,
+        })
+    }
+
+    pub fn generate(&mut self, text: &str) -> Result<Generation> {
+        self.engine.generate(text).map_err(ModelError::message)
+    }
+
+    pub fn backend(&self) -> &'static str {
+        self.backend
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+}
+
+struct Engine {
     enc: Session,
     dec: Session,
     sp: SentencePieceProcessor,
@@ -411,5 +457,6 @@ mod tests {
         let paths = AppPaths::with_data_dir(tempfile::tempdir().unwrap().path());
         let error = warm(&paths).unwrap_err().to_string();
         assert!(error.contains("intent model"));
+        assert!(IntentEngine::load(&paths).is_err());
     }
 }

@@ -46,4 +46,14 @@ fn published_intent_release_installs_and_warms() {
         warmup.backend, warmup.detail
     );
     assert!(!warmup.backend.is_empty());
+
+    let mut engine = jarvis_models::IntentEngine::load(&paths).unwrap();
+    let generation = engine.generate("open chrome").unwrap();
+    eprintln!(
+        "intent generation: backend={} confidence={:.3} raw={}",
+        engine.backend(),
+        generation.confidence,
+        generation.raw
+    );
+    assert!(generation.raw.contains("app.open"));
 }

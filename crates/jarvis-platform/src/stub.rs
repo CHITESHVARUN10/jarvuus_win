@@ -42,6 +42,7 @@ pub fn open_path(path: &Path) -> Result<(), String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HotkeyEvent {
     Pressed,
+    CommandPressed,
 }
 
 pub struct HotkeyRegistration;
@@ -55,6 +56,13 @@ pub fn start_dictation_hotkey(
     _waker: crate::Wake,
 ) -> Result<HotkeyRegistration, String> {
     Err("Global dictation hotkeys are Windows-only in this preview.".into())
+}
+
+pub fn start_command_hotkey(
+    _sender: Sender<HotkeyEvent>,
+    _waker: crate::Wake,
+) -> Result<HotkeyRegistration, String> {
+    Err("Global command hotkeys are Windows-only in this preview.".into())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

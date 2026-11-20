@@ -23,6 +23,7 @@ jarvis-core = { path = "../jarvis-core" }
 jarvis-platform = { path = "../jarvis-platform" }
 jarvis-models = { path = "../jarvis-models" }
 jarvis-speech = { path = "../jarvis-speech" }
+jarvis-commands = { path = "../jarvis-commands" }
 rune = { git = "https://github.com/anomalyco/rune", rev = "6ba947e580f2d864bb333d913ba843284e57f427" }
 
 [dev-dependencies]

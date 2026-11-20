@@ -17,7 +17,7 @@ use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, SendInput, UnregisterHotKey, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VIRTUAL_KEY,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VIRTUAL_KEY, VK_A,
     VK_CONTROL, VK_D, VK_V,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -146,6 +146,7 @@ pub fn open_path(path: &Path) -> Result<(), String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HotkeyEvent {
     Pressed,
+    CommandPressed,
 }
 
 pub struct HotkeyRegistration {
@@ -174,13 +175,38 @@ pub fn start_dictation_hotkey(
     sender: Sender<HotkeyEvent>,
     waker: crate::Wake,
 ) -> Result<HotkeyRegistration, String> {
+    start_hotkey(sender, waker, 1, VK_D, "Ctrl+Shift+D", HotkeyEvent::Pressed)
+}
+
+pub fn start_command_hotkey(
+    sender: Sender<HotkeyEvent>,
+    waker: crate::Wake,
+) -> Result<HotkeyRegistration, String> {
+    start_hotkey(
+        sender,
+        waker,
+        2,
+        VK_A,
+        "Ctrl+Shift+A",
+        HotkeyEvent::CommandPressed,
+    )
+}
+
+fn start_hotkey(
+    sender: Sender<HotkeyEvent>,
+    waker: crate::Wake,
+    id: i32,
+    key: VIRTUAL_KEY,
+    label: &'static str,
+    event: HotkeyEvent,
+) -> Result<HotkeyRegistration, String> {
     let (ready, readiness) = mpsc::channel();
     let join = thread::spawn(move || {
         let thread_id = unsafe { GetCurrentThreadId() };
         let modifiers = MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT;
-        if let Err(error) = unsafe { RegisterHotKey(None, 1, modifiers, VK_D.0 as u32) } {
+        if let Err(error) = unsafe { RegisterHotKey(None, id, modifiers, key.0 as u32) } {
             let _ = ready.send(Err(format!(
-                "Could not register Ctrl+Shift+D: {error}. Another app may already use it."
+                "Could not register {label}: {error}. Another app may already use it."
             )));
             return;
         }
@@ -192,15 +218,15 @@ pub fn start_dictation_hotkey(
             if result.0 == 0 || result.0 == -1 {
                 break;
             }
-            if message.message == WM_HOTKEY && message.wParam.0 == 1 {
-                if sender.send(HotkeyEvent::Pressed).is_err() {
+            if message.message == WM_HOTKEY && message.wParam.0 == id as usize {
+                if sender.send(event).is_err() {
                     break;
                 }
                 waker();
             }
         }
         unsafe {
-            let _ = UnregisterHotKey(None, 1);
+            let _ = UnregisterHotKey(None, id);
         }
     });
 
@@ -213,7 +239,7 @@ pub fn start_dictation_hotkey(
             let _ = join.join();
             Err(error)
         }
-        Err(_) => Err("Timed out while registering the dictation hotkey.".into()),
+        Err(_) => Err(format!("Timed out while registering {label}.")),
     }
 }
 

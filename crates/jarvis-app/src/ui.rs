@@ -4,7 +4,7 @@ use jarvis_core::ThemeChoice;
 use jarvis_models::manager::{ModelKind, ModelPhase};
 use jarvis_speech::DictationState;
 use rune::tok::{self, radius, space, type_, Theme};
-use rune::{col, el, oklch, row, text, Color, Cx, El, ScrollSpec, TextStyle};
+use rune::{col, el, oklch, row, text, text_input, Color, Cx, El, ScrollSpec, TextStyle};
 
 use crate::{Jarvis, Notice, NoticeTone, Section, SettingsPage};
 
@@ -315,7 +315,7 @@ fn sidebar_footer(state: &Jarvis, p: Paint) -> El {
                 .justify_between()
                 .gap(10.0)
                 .child(
-                    text(format!("v{} · phase 3", state.version))
+                    text(format!("v{} · phase 4", state.version))
                         .font(TextStyle::new(11.0, 500.0))
                         .color(p.t.text_secondary),
                 )
@@ -328,168 +328,430 @@ fn sidebar_footer(state: &Jarvis, p: Paint) -> El {
 }
 
 fn assistant_page(state: &Jarvis, p: Paint) -> El {
-    let (headline, color, detail) = if state.setup_running {
+    let complete = state.setup.essentials_complete();
+    let (headline, detail) = if state.setup_running {
         (
             "Checking this machine",
-            p.accent,
             "Looking at microphone access, models and acceleration.".to_string(),
         )
-    } else if state.setup.essentials_complete() {
+    } else if complete {
         (
-            "Jarvis is ready",
-            success_color(),
-            "Speech and intent models are installed. The voice pipeline arrives in the next phases."
+            "Ask Jarvis",
+            "Run local commands. The intent model and Ollama are only consulted when needed."
                 .to_string(),
         )
     } else {
         (
             "Finish setup",
-            warning_color(),
             format!(
-                "{} of {} essentials are ready. Open setup to see what is missing.",
+                "{} of {} essentials are ready. Local commands still work.",
                 state.setup.essentials_ready, state.setup.essentials_total
             ),
         )
     };
 
-    col()
+    let mut page = col()
         .key("assistant-page")
         .w_full()
-        .items_center()
-        .gap(26.0)
-        .py(space::S6)
-        .child(orb(p))
+        .max_w(860.0)
+        .gap(16.0)
         .child(
-            col()
-                .items_center()
-                .gap(8.0)
+            row()
+                .w_full()
+                .gap(16.0)
+                .center_y()
+                .child(orb_sized(p, 88.0))
                 .child(
-                    text("Jarvis for Windows")
-                        .font(TextStyle::new(30.0, 650.0))
-                        .color(p.t.text),
-                )
+                    col()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .gap(5.0)
+                        .child(
+                            text(headline)
+                                .font(TextStyle::new(28.0, 650.0))
+                                .color(p.t.text),
+                        )
+                        .child(text(detail).font(type_::BODY).color(p.t.text_secondary))
+                        .child(
+                            row()
+                                .gap(8.0)
+                                .center_y()
+                                .child(hotkey_chip(
+                                    p,
+                                    "assistant-command-hotkey",
+                                    "Ctrl + Shift + A",
+                                ))
+                                .child(
+                                    text(if state.command.hotkey_error.is_some() {
+                                        if cfg!(windows) {
+                                            "Command hotkey unavailable"
+                                        } else {
+                                            "Hotkey available on Windows"
+                                        }
+                                    } else {
+                                        "Global command"
+                                    })
+                                    .font(type_::LABEL)
+                                    .color(p.t.text_secondary),
+                                ),
+                        ),
+                ),
+        )
+        .child(command_card(state, p));
+
+    match state.command.records.first() {
+        Some(record) => page = page.child(command_result_card(record, p)),
+        None => page = page.child(suggestions_card(p)),
+    }
+    if state.command.records.len() > 1 {
+        page = page.child(history_card(state, p));
+    }
+    if !complete {
+        page = page.child(setup_hint_card(p));
+    }
+    page
+}
+
+fn command_card(state: &Jarvis, p: Paint) -> El {
+    let busy = state.command.busy;
+    let has_input = !state.command.input.text.trim().is_empty();
+    let listening = state.speech.mode == crate::app::SpeechMode::Command
+        && state.speech.state == DictationState::Listening;
+    let mut card = card(p, "assistant-command")
+        .child(
+            row()
+                .w_full()
+                .justify_between()
+                .center_y()
+                .child(section_heading(p, "Command"))
                 .child(
-                    text("Speech, intent and command routing stay on this machine.")
-                        .font(TextStyle::new(14.0, 400.0))
-                        .color(p.t.text_secondary),
+                    row().gap(8.0).center_y().child(
+                        text("Type, or speak with the hotkey")
+                            .font(type_::LABEL)
+                            .color(p.t.text_secondary),
+                    ),
                 ),
         )
         .child(
-            col()
-                .key("assistant-cards")
+            row()
+                .key("assistant-command-field")
                 .w_full()
-                .max_w(640.0)
-                .gap(12.0)
+                .h(46.0)
+                .px(12.0)
+                .radius(radius::MD)
+                .fill(p.t.control_off)
+                .border(p.hair, p.t.card_border)
+                .center_y()
                 .child(
-                    card(p, "assistant-status").child(
-                        row()
-                            .gap(16.0)
-                            .center_y()
-                            .child(
-                                col()
-                                    .grow(1.0)
-                                    .min_w(0.0)
-                                    .gap(4.0)
-                                    .child(
-                                        row()
-                                            .gap(8.0)
-                                            .center_y()
-                                            .child(
-                                                el().size(8.0, 8.0)
-                                                    .radius(4.0)
-                                                    .fill(color)
-                                                    .a11y_hidden(),
-                                            )
-                                            .child(
-                                                text(headline)
-                                                    .font(TextStyle::new(15.0, 600.0))
-                                                    .color(p.t.text),
-                                            ),
-                                    )
-                                    .child(
-                                        text(detail).font(type_::BODY).color(p.t.text_secondary),
-                                    ),
-                            )
-                            .child(secondary_button(
-                                p,
-                                "assistant-open-setup",
-                                if state.setup.essentials_complete() {
-                                    "Review setup"
-                                } else {
-                                    "Open setup"
-                                },
-                                true,
-                                |state| state.open_settings(SettingsPage::Setup),
-                            )),
+                    text_input(&state.command.input, TextStyle::new(15.0, 400.0))
+                        .key("assistant-command-input")
+                        .single_line()
+                        .placeholder(
+                            "Try: open chrome and set volume to 30",
+                            p.t.text_secondary.alpha(0.38),
+                        )
+                        .w_full()
+                        .h(40.0)
+                        .on_edit(|state: &mut Jarvis| &mut state.command.input)
+                        .on_submit(|state: &mut Jarvis, _tx| state.submit_command()),
+                ),
+        )
+        .child(
+            row()
+                .gap(8.0)
+                .center_y()
+                .child(primary_button(
+                    p,
+                    "assistant-run",
+                    if busy { "Working..." } else { "Run" },
+                    !busy && has_input,
+                    |state| state.submit_command(),
+                ))
+                .child(secondary_button(
+                    p,
+                    "assistant-command-mic",
+                    if listening {
+                        "Stop command"
+                    } else {
+                        "Speak command"
+                    },
+                    !busy && (listening || !state.speech.state.is_active()),
+                    |state| state.begin_command_dictation(),
+                ))
+                .child(
+                    text(if busy {
+                        state.command.status.clone()
+                    } else {
+                        "Rules first · local model and Ollama fallback".into()
+                    })
+                    .font(type_::LABEL)
+                    .color(p.t.text_secondary),
+                ),
+        );
+
+    if state.command.hotkey_error.is_some() && cfg!(windows) {
+        card = card.child(row().w_full().justify_end().child(link_button(
+            p,
+            "assistant-retry-command-hotkey",
+            "Retry command hotkey",
+            |state| state.register_command_hotkey(),
+        )));
+    }
+    card
+}
+
+fn command_result_card(record: &crate::CommandRecord, p: Paint) -> El {
+    let color = if record.ok {
+        success_color()
+    } else {
+        danger_color()
+    };
+    let mut card = card(p, "assistant-result").child(
+        row()
+            .w_full()
+            .gap(16.0)
+            .center_y()
+            .justify_between()
+            .child(
+                col()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .gap(3.0)
+                    .child(section_heading(p, "Last command"))
+                    .child(
+                        text(record.input.clone())
+                            .font(TextStyle::new(17.0, 550.0))
+                            .color(p.t.text),
                     ),
-                )
-                .child(capability_row(p)),
+            )
+            .child(
+                row()
+                    .key("assistant-result-source")
+                    .h(22.0)
+                    .px(8.0)
+                    .radius(11.0)
+                    .center()
+                    .fill(color.alpha(0.14))
+                    .child(text(record.source.clone()).font(type_::LABEL).color(color)),
+            ),
+    );
+
+    if !record.actions.is_empty() {
+        let mut plan = col().gap(2.0);
+        for (index, action) in record.actions.iter().enumerate() {
+            plan = plan.child(
+                text(action.clone())
+                    .key(format!("assistant-result-action-{index}"))
+                    .font(type_::LABEL)
+                    .color(p.t.text_secondary),
+            );
+        }
+        card = card.child(section_heading(p, "Plan")).child(plan);
+    }
+
+    let mut messages = col().gap(6.0);
+    for (index, message) in record.messages.iter().enumerate() {
+        messages = messages.child(
+            text(message.clone())
+                .key(if index == 0 {
+                    "assistant-result-message".to_string()
+                } else {
+                    format!("assistant-result-message-{index}")
+                })
+                .w_full()
+                .font(if record.actions.is_empty() {
+                    TextStyle::new(16.0, 450.0)
+                } else {
+                    type_::BODY
+                })
+                .color(p.t.text),
+        );
+    }
+    card = card.child(messages);
+
+    if !record.files.is_empty() {
+        let mut files = col().gap(6.0);
+        for (index, file) in record.files.iter().take(6).enumerate() {
+            let open_key = format!("assistant-file-open-{index}");
+            let reveal_key = format!("assistant-file-reveal-{index}");
+            files = files.child(
+                row()
+                    .w_full()
+                    .gap(10.0)
+                    .center_y()
+                    .justify_between()
+                    .child(
+                        col()
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .gap(1.0)
+                            .child(text(file.name.clone()).font(type_::BODY).color(p.t.text))
+                            .child(
+                                text(file.path.clone())
+                                    .font(type_::LABEL)
+                                    .color(p.t.text_secondary)
+                                    .truncate_middle(),
+                            ),
+                    )
+                    .child(
+                        row()
+                            .gap(4.0)
+                            .child(link_button(p, &open_key, "Open", move |state| {
+                                state.open_command_file(index, false)
+                            }))
+                            .child(link_button(p, &reveal_key, "Reveal", move |state| {
+                                state.open_command_file(index, true)
+                            })),
+                    ),
+            );
+        }
+        card = card.child(section_heading(p, "Files")).child(files);
+    }
+    card
+}
+
+fn suggestions_card(p: Paint) -> El {
+    card(p, "assistant-suggestions")
+        .child(section_heading(p, "Try a command"))
+        .child(
+            row()
+                .gap(8.0)
+                .child(suggestion_button(p, "suggestion-open", "Open Chrome"))
+                .child(suggestion_button(
+                    p,
+                    "suggestion-volume",
+                    "Set volume to 30",
+                )),
+        )
+        .child(
+            row()
+                .gap(8.0)
+                .child(suggestion_button(p, "suggestion-time", "What time is it?"))
+                .child(suggestion_button(
+                    p,
+                    "suggestion-files",
+                    "Find PDFs in Downloads",
+                )),
+        )
+        .child(
+            text("Commands run on this PC. Free-form questions use Ollama when it is running.")
+                .font(type_::LABEL)
+                .color(p.t.text_secondary),
         )
 }
 
-fn orb(p: Paint) -> El {
+fn suggestion_button(p: Paint, key: &str, label: &'static str) -> El {
+    secondary_button(p, key, label, true, move |state| {
+        state.run_command_text(label.to_string())
+    })
+}
+
+fn history_card(state: &Jarvis, p: Paint) -> El {
+    let mut rows = col().gap(8.0);
+    for (index, record) in state.command.records.iter().skip(1).take(6).enumerate() {
+        let color = if record.ok {
+            success_color()
+        } else {
+            danger_color()
+        };
+        rows = rows.child(
+            row()
+                .key(format!("assistant-history-{index}"))
+                .w_full()
+                .gap(12.0)
+                .center_y()
+                .justify_between()
+                .child(
+                    text(record.input.clone())
+                        .font(type_::BODY)
+                        .color(p.t.text)
+                        .max_w(520.0)
+                        .truncate_middle(),
+                )
+                .child(text(record.source.clone()).font(type_::LABEL).color(color)),
+        );
+    }
+    card(p, "assistant-history")
+        .child(section_heading(p, "Recent"))
+        .child(rows)
+}
+
+fn setup_hint_card(p: Paint) -> El {
+    card(p, "assistant-setup").child(
+        row()
+            .w_full()
+            .gap(16.0)
+            .center_y()
+            .justify_between()
+            .child(
+                col()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .gap(4.0)
+                    .child(
+                        text("Some setup items are still missing.")
+                            .font(TextStyle::new(15.0, 600.0))
+                            .color(warning_color()),
+                    )
+                    .child(
+                        text("Models and microphone checks live in Setup.")
+                            .font(type_::BODY)
+                            .color(p.t.text_secondary),
+                    ),
+            )
+            .child(secondary_button(
+                p,
+                "assistant-open-setup",
+                "Open setup",
+                true,
+                |state| state.open_settings(SettingsPage::Setup),
+            )),
+    )
+}
+
+fn hotkey_chip(p: Paint, key: &str, label: &str) -> El {
+    row()
+        .key(key.to_string())
+        .h(22.0)
+        .px(8.0)
+        .radius(11.0)
+        .center()
+        .fill(p.t.control_track)
+        .child(
+            text(label.to_string())
+                .font(type_::MONO_CAPTION)
+                .color(p.t.text_secondary),
+        )
+}
+
+fn orb_sized(p: Paint, size: f32) -> El {
+    let inner = size * 0.67;
+    let core = size * 0.37;
+    let dot = size * 0.09;
     el().key("orb")
-        .size(196.0, 196.0)
-        .radius(98.0)
+        .size(size, size)
+        .radius(size / 2.0)
         .fill(p.accent.alpha(0.07))
-        .shadow(0.0, 40.0, p.accent.alpha(0.14))
+        .shadow(0.0, size * 0.2, p.accent.alpha(0.14))
         .center()
         .child(
-            el().size(132.0, 132.0)
-                .radius(66.0)
+            el().size(inner, inner)
+                .radius(inner / 2.0)
                 .fill(p.accent.alpha(0.13))
                 .center()
                 .child(
-                    el().size(72.0, 72.0)
-                        .radius(36.0)
+                    el().size(core, core)
+                        .radius(core / 2.0)
                         .fill(p.accent)
-                        .shadow(0.0, 18.0, p.accent.alpha(0.45))
+                        .shadow(0.0, size * 0.09, p.accent.alpha(0.45))
                         .center()
                         .child(
-                            el().size(18.0, 18.0)
-                                .radius(9.0)
+                            el().size(dot, dot)
+                                .radius(dot / 2.0)
                                 .fill(Color::WHITE.alpha(0.85)),
                         ),
                 ),
         )
-}
-
-fn capability_row(p: Paint) -> El {
-    row()
-        .w_full()
-        .gap(12.0)
-        .child(capability_card(
-            p,
-            "Speech",
-            "Whisper large-v3-turbo",
-            "Local transcription",
-        ))
-        .child(capability_card(
-            p,
-            "Intent",
-            "t5-small · int8 ONNX",
-            "Managed release",
-        ))
-        .child(capability_card(
-            p,
-            "Acceleration",
-            "Vulkan + DirectML",
-            "GPU first, CPU fallback",
-        ))
-}
-
-fn capability_card(p: Paint, title: &str, value: &str, detail: &str) -> El {
-    col()
-        .grow(1.0)
-        .min_w(0.0)
-        .padding(14.0)
-        .gap(5.0)
-        .fill(p.t.card)
-        .radius(radius::MD)
-        .border(p.hair, p.t.card_border)
-        .child(text(title).font(type_::SECTION).color(p.t.text_secondary))
-        .child(text(value).font(type_::BODY).color(p.t.text))
-        .child(text(detail).font(type_::LABEL).color(p.t.text_secondary))
 }
 
 fn settings_page(state: &Jarvis, p: Paint) -> El {
@@ -1340,7 +1602,7 @@ fn about_page(state: &Jarvis, p: Paint) -> El {
                 .child(section_heading(p, "About"))
                 .child(info_row(p, "Application", "Jarvis for Windows"))
                 .child(info_row(p, "Version", state.version))
-                .child(info_row(p, "Build", "Phase 3 · dictation"))
+                .child(info_row(p, "Build", "Phase 4 · commands"))
                 .child(info_row(p, "Platform", std::env::consts::OS))
                 .child(info_row(
                     p,
@@ -1402,7 +1664,7 @@ fn placeholder_page(section: Section, p: Paint) -> El {
         .child(
             card(p, "placeholder-card")
                 .child(
-                    text("This screen arrives in a later build. Phase 3 ships the app shell, setup, model downloads and local dictation.")
+                    text("This screen arrives in a later build. Phase 4 ships the app shell, setup, models, local dictation and Windows commands.")
                         .font(type_::BODY)
                         .color(p.t.text_secondary),
                 )
@@ -1625,6 +1887,59 @@ mod tests {
         assert!(runtime.find("model-progress-speech").is_some());
         assert!(runtime.find("cancel-speech-model").is_some());
         assert!(runtime.find("download-speech-model").is_none());
+    }
+
+    #[test]
+    fn the_assistant_page_shows_the_command_bar() {
+        let mut state = Jarvis::for_test();
+        state.section = Section::Assistant;
+        state.setup = Jarvis::demo_report(true);
+        let mut runtime = Runtime::new(state, view, (1120.0, 760.0), Env::new(true, 1.0));
+        runtime.frame(0.0);
+
+        assert!(runtime.find("assistant-page").is_some());
+        assert!(runtime.find("assistant-command-input").is_some());
+        assert!(runtime.find("assistant-run").is_some());
+        assert!(runtime.find("assistant-command-mic").is_some());
+        assert!(runtime.find("assistant-command-hotkey").is_some());
+        assert!(runtime.find("assistant-suggestions").is_some());
+    }
+
+    #[test]
+    fn a_command_result_renders_plan_messages_and_files() {
+        let mut state = Jarvis::for_test();
+        state.section = Section::Assistant;
+        state.setup = Jarvis::demo_report(true);
+        state.command.records.push(crate::CommandRecord {
+            input: "find pdfs in downloads".into(),
+            source: "Rules".into(),
+            actions: vec!["Files: list in 'downloads' [pdf]".into()],
+            messages: vec!["Found 2 matching file(s).".into()],
+            files: vec![
+                jarvis_platform::FileHit {
+                    name: "review.pdf".into(),
+                    path: r"C:\Users\Test\Downloads\review.pdf".into(),
+                    size: 1200,
+                    modified: "2026-11-20 09:00".into(),
+                },
+                jarvis_platform::FileHit {
+                    name: "notes.pdf".into(),
+                    path: r"C:\Users\Test\Downloads\notes.pdf".into(),
+                    size: 800,
+                    modified: "2026-11-19 12:00".into(),
+                },
+            ],
+            ok: true,
+        });
+        let mut runtime = Runtime::new(state, view, (1120.0, 760.0), Env::new(true, 1.0));
+        runtime.frame(0.0);
+
+        assert!(runtime.find("assistant-result").is_some());
+        assert!(runtime.find("assistant-result-source").is_some());
+        assert!(runtime.find("assistant-result-action-0").is_some());
+        assert!(runtime.find("assistant-result-message").is_some());
+        assert!(runtime.find("assistant-file-open-0").is_some());
+        assert!(runtime.find("assistant-file-reveal-0").is_some());
     }
 
     #[test]

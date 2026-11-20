@@ -19,9 +19,13 @@ use stub as imp;
 use windows as imp;
 
 pub use imp::{
-    copy_text, insert_text, start_dictation_hotkey, HotkeyEvent, HotkeyRegistration,
-    InsertionOutcome,
+    copy_text, insert_text, start_command_hotkey, start_dictation_hotkey, HotkeyEvent,
+    HotkeyRegistration, InsertionOutcome,
 };
+
+mod execute;
+pub use execute::{execute, open_file};
+pub use jarvis_commands::execution::{ActionOutcome, FileHit};
 
 #[cfg(all(test, not(windows)))]
 mod tests {
@@ -31,7 +35,8 @@ mod tests {
     #[test]
     fn preview_builds_report_windows_only_hotkeys_and_insertion() {
         let (sender, _receiver) = mpsc::channel();
-        assert!(start_dictation_hotkey(sender, Arc::new(|| {})).is_err());
+        assert!(start_dictation_hotkey(sender.clone(), Arc::new(|| {})).is_err());
+        assert!(start_command_hotkey(sender, Arc::new(|| {})).is_err());
         assert!(insert_text("hello").is_err());
         assert!(copy_text("hello").is_err());
     }

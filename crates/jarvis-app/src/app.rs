@@ -9,7 +9,9 @@ use jarvis_core::setup::{SetupAction, SetupItem, SetupKind, SetupReport, SetupSt
 use jarvis_models::manager::{ModelKind, ModelManager, ModelPhase, ModelUpdate};
 use jarvis_platform::{HotkeyEvent, HotkeyRegistration, InsertionOutcome};
 use jarvis_speech::{DictationController, DictationState, SpeechEvent};
-use rune::{Tx, Waker};
+use rune::{TextEdit, Tx, Waker};
+
+use crate::command::{CommandEvent, CommandService, CommandUi};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
@@ -145,9 +147,16 @@ impl ModelsUi {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpeechMode {
+    Dictate,
+    Command,
+}
+
 #[derive(Clone, Debug)]
 pub struct SpeechUi {
     pub session: u64,
+    pub mode: SpeechMode,
     pub state: DictationState,
     pub detail: String,
     pub level: f32,
@@ -165,6 +174,7 @@ impl SpeechUi {
     pub fn new() -> Self {
         Self {
             session: 0,
+            mode: SpeechMode::Dictate,
             state: DictationState::Idle,
             detail: "Press Ctrl + Shift + D or Start to dictate.".into(),
             level: 0.0,
@@ -280,7 +290,11 @@ pub struct Jarvis {
     pub model_manager: ModelManager,
     pub speech: SpeechUi,
     pub dictation: DictationController,
+    pub command: CommandUi,
     pub hotkey: Option<HotkeyRegistration>,
+    pub command_hotkey: Option<HotkeyRegistration>,
+    command_service: CommandService,
+    command_rx: Receiver<CommandEvent>,
     rx: Option<Receiver<SetupReport>>,
     model_rx: Receiver<ModelUpdate>,
     speech_rx: Receiver<SpeechEvent>,
@@ -327,6 +341,8 @@ impl Jarvis {
         let dictation = DictationController::new(paths.clone(), speech_sender);
         let (insertion_tx, insertion_rx) = mpsc::channel();
         let (hotkey_tx, hotkey_rx) = mpsc::channel();
+        let command = CommandUi::new();
+        let (command_service, command_rx) = CommandService::new(paths.clone());
 
         Self {
             paths,
@@ -342,7 +358,11 @@ impl Jarvis {
             model_manager,
             speech,
             dictation,
+            command,
             hotkey: None,
+            command_hotkey: None,
+            command_service,
+            command_rx,
             rx: None,
             model_rx,
             speech_rx,
@@ -378,6 +398,8 @@ impl Jarvis {
         let dictation = DictationController::new(paths.clone(), speech_sender);
         let (insertion_tx, insertion_rx) = mpsc::channel();
         let (hotkey_tx, hotkey_rx) = mpsc::channel();
+        let command = CommandUi::new();
+        let (command_service, command_rx) = CommandService::new(paths.clone());
         Self {
             paths,
             settings,
@@ -400,7 +422,11 @@ impl Jarvis {
             model_manager,
             speech,
             dictation,
+            command,
             hotkey: None,
+            command_hotkey: None,
+            command_service,
+            command_rx,
             rx: None,
             model_rx,
             speech_rx,
@@ -516,7 +542,30 @@ impl Jarvis {
     }
 
     pub fn start_dictation(&mut self) {
+        self.speech.mode = SpeechMode::Dictate;
+        self.start_capture_dictation();
+    }
+
+    pub fn begin_command_dictation(&mut self) {
+        if self.command.busy {
+            return;
+        }
+        if self.speech.mode == SpeechMode::Command && self.speech.state == DictationState::Listening
+        {
+            self.stop_dictation();
+            return;
+        }
+        if self.speech.state.is_active() {
+            return;
+        }
+        self.section = Section::Assistant;
+        self.speech.mode = SpeechMode::Command;
+        self.start_capture_dictation();
+    }
+
+    fn start_capture_dictation(&mut self) {
         if let Err(error) = self.dictation.start() {
+            self.speech.mode = SpeechMode::Dictate;
             self.speech.state = DictationState::Error;
             self.speech.detail = error;
             self.speech.partial.clear();
@@ -529,6 +578,7 @@ impl Jarvis {
     }
 
     pub fn cancel_dictation(&mut self) {
+        self.speech.mode = SpeechMode::Dictate;
         self.dictation.cancel();
     }
 
@@ -537,6 +587,68 @@ impl Jarvis {
             DictationState::Listening => self.stop_dictation(),
             DictationState::Processing => self.cancel_dictation(),
             _ => self.start_dictation(),
+        }
+    }
+
+    pub fn submit_command(&mut self) {
+        if self.command.busy {
+            return;
+        }
+        let text = self.command.input.text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.command.input = TextEdit::new("");
+        self.run_command_text(text);
+    }
+
+    pub fn run_command_text(&mut self, text: String) {
+        if self.command.busy {
+            return;
+        }
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.section = Section::Assistant;
+        match self.command_service.run(text.clone()) {
+            Ok(()) => {
+                self.command.busy = true;
+                self.command.status = "Planning...".into();
+                self.command.active_input = text;
+            }
+            Err(error) => {
+                self.command.status = error;
+            }
+        }
+    }
+
+    pub fn open_command_file(&mut self, index: usize, reveal: bool) {
+        let Some(record) = self.command.records.first() else {
+            return;
+        };
+        let Some(file) = record.files.get(index) else {
+            return;
+        };
+        if let Err(error) = jarvis_platform::open_file(&file.path, reveal) {
+            self.notice = Some(Notice::error(format!(
+                "Could not open {}: {error}",
+                file.name
+            )));
+        }
+    }
+
+    pub fn register_command_hotkey(&mut self) {
+        let waker: Waker = self
+            .waker
+            .clone()
+            .unwrap_or_else(|| std::sync::Arc::new(|| {}));
+        match jarvis_platform::start_command_hotkey(self.hotkey_tx.clone(), waker) {
+            Ok(handle) => {
+                self.command_hotkey = Some(handle);
+                self.command.hotkey_error = None;
+            }
+            Err(error) => self.command.hotkey_error = Some(error),
         }
     }
 
@@ -582,12 +694,18 @@ impl Jarvis {
             return;
         }
         if let Some(text) = final_text {
-            self.start_insertion(text);
+            if self.speech.mode == SpeechMode::Command {
+                self.speech.mode = SpeechMode::Dictate;
+                self.run_command_text(text);
+            } else {
+                self.start_insertion(text);
+            }
         }
         if audio_limit {
             self.stop_dictation();
         }
         if error {
+            self.speech.mode = SpeechMode::Dictate;
             self.dictation.abort();
         }
     }
@@ -765,11 +883,15 @@ pub fn setup_hook(state: &mut Jarvis, waker: Waker) {
     state.waker = Some(waker.clone());
     state.model_manager.set_notifier(waker.clone());
     state.dictation.set_notifier(waker.clone());
+    state.command_service.set_notifier(waker.clone());
     if state.setup.checked_at.is_some() {
         return;
     }
     if state.hotkey.is_none() && state.speech.hotkey_error.is_none() {
         state.register_hotkey();
+    }
+    if state.command_hotkey.is_none() && state.command.hotkey_error.is_none() {
+        state.register_command_hotkey();
     }
     state.start_setup_probe(waker);
 }
@@ -785,13 +907,18 @@ pub fn poll(state: &mut Jarvis, _clock: f64, _tx: &mut Tx) -> bool {
         changed = true;
     }
     while let Ok(event) = state.hotkey_rx.try_recv() {
-        if event == HotkeyEvent::Pressed {
-            state.toggle_dictation();
-            changed = true;
+        match event {
+            HotkeyEvent::Pressed => state.toggle_dictation(),
+            HotkeyEvent::CommandPressed => state.begin_command_dictation(),
         }
+        changed = true;
     }
     while let Ok(result) = state.insertion_rx.try_recv() {
         state.apply_insertion_result(result);
+        changed = true;
+    }
+    while let Ok(event) = state.command_rx.try_recv() {
+        state.command.apply(event);
         changed = true;
     }
 

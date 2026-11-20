@@ -5,6 +5,7 @@ members = [
     "crates/jarvis-platform",
     "crates/jarvis-models",
     "crates/jarvis-speech",
+    "crates/jarvis-commands",
     "crates/jarvis-app",
 ]
 
