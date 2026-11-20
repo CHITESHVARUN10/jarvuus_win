@@ -2,9 +2,11 @@ mod app;
 mod command;
 mod ui;
 
-pub use app::{Jarvis, Notice, NoticeTone, Section, SettingsPage};
+pub use app::{HotkeyTarget, Jarvis, Notice, NoticeTone, Section, SettingsPage};
 pub use command::{CommandRecord, CommandUi};
 
+use jarvis_core::insights::day_key_ago;
+use jarvis_core::Insights;
 use jarvis_models::manager::{ModelKind, ModelPhase, ModelUpdate};
 use jarvis_speech::DictationState;
 use rune::AppSpec;
@@ -106,9 +108,52 @@ const SCENES: &[Scene] = &[
         .with_backend("directml")
         .with_version("1.0.2");
     }),
+    ("routines", |state| {
+        state.section = Section::Routines;
+        state.setup = Jarvis::demo_report(true);
+        state.setup_running = false;
+        state
+            .routines
+            .add("Focus time", "open chrome and open vscode")
+            .unwrap();
+        state
+            .routines
+            .add("Wind down", "close chrome and pause")
+            .unwrap();
+        state
+            .routines
+            .add("Morning brief", "what time is it and mute")
+            .unwrap();
+    }),
+    ("insights", |state| {
+        state.section = Section::Insights;
+        state.setup = Jarvis::demo_report(true);
+        state.setup_running = false;
+        state.insights = Insights::default();
+        for (offset, count, source, ok) in [
+            (6, 3, "Rules", true),
+            (5, 5, "Rules", true),
+            (4, 2, "Intent model", true),
+            (3, 6, "Rules", true),
+            (2, 4, "Ollama", true),
+            (1, 7, "Rules", false),
+            (0, 5, "Rules", true),
+        ] {
+            for _ in 0..count {
+                state.insights.record_on(&day_key_ago(offset), source, ok);
+            }
+        }
+    }),
     ("appearance", |state| {
         state.section = Section::Appearance;
         state.setup = Jarvis::demo_report(true);
+    }),
+    ("settings", |state| {
+        state.section = Section::Settings;
+        state.settings_page = SettingsPage::General;
+        state.setup = Jarvis::demo_report(true);
+        state.settings.launch_at_login = true;
+        state.settings.close_to_tray = true;
     }),
     ("about", |state| {
         state.section = Section::Settings;
@@ -118,10 +163,16 @@ const SCENES: &[Scene] = &[
 ];
 
 pub fn run() {
-    rune::run(AppSpec {
+    let app = rune::App::new(AppSpec {
         setup: Some(app::setup_hook),
         poll: Some(app::poll),
+        on_key: Some(app::on_key),
         scenes: SCENES,
         ..AppSpec::new("Jarvis", (1120.0, 760.0), Jarvis::new, ui::view)
-    });
+    })
+    .keep_running()
+    .on_close(app::on_close)
+    .on_ready(|handle| app::remember_window(handle.clone()));
+    app::remember_app_handle(app.handle());
+    app.run();
 }

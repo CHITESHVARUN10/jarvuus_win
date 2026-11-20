@@ -43,6 +43,7 @@ pub struct AppSettings {
     pub dictation_hotkey: String,
     pub command_hotkey: String,
     pub launch_at_login: bool,
+    pub close_to_tray: bool,
     pub microphone: Option<String>,
 }
 
@@ -56,6 +57,7 @@ impl Default for AppSettings {
             dictation_hotkey: "Ctrl+Shift+D".into(),
             command_hotkey: "Ctrl+Shift+A".into(),
             launch_at_login: false,
+            close_to_tray: true,
             microphone: None,
         }
     }
@@ -91,6 +93,8 @@ mod tests {
         assert_eq!(settings.accent, 0);
         assert_eq!(settings.dictation_hotkey, "Ctrl+Shift+D");
         assert_eq!(settings.command_hotkey, "Ctrl+Shift+A");
+        assert!(settings.close_to_tray);
+        assert!(!settings.launch_at_login);
     }
 
     #[test]

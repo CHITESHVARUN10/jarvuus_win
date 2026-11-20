@@ -17,6 +17,8 @@ pub struct AppPaths {
     pub whisper_model_dir: PathBuf,
     pub logs_dir: PathBuf,
     pub settings_file: PathBuf,
+    pub routines_file: PathBuf,
+    pub insights_file: PathBuf,
     pub log_file: PathBuf,
 }
 
@@ -38,6 +40,8 @@ impl AppPaths {
 
         Self {
             settings_file: data_dir.join("settings.json"),
+            routines_file: data_dir.join("routines.json"),
+            insights_file: data_dir.join("insights.json"),
             log_file: logs_dir.join("commands.log"),
             intent_dir: models_dir.join("intent"),
             models_dir,
@@ -114,6 +118,14 @@ mod tests {
         assert_eq!(
             paths.settings_file,
             PathBuf::from("/tmp/jarvis-test/settings.json")
+        );
+        assert_eq!(
+            paths.routines_file,
+            PathBuf::from("/tmp/jarvis-test/routines.json")
+        );
+        assert_eq!(
+            paths.insights_file,
+            PathBuf::from("/tmp/jarvis-test/insights.json")
         );
         assert_eq!(
             paths.log_file,

@@ -19,8 +19,8 @@ use stub as imp;
 use windows as imp;
 
 pub use imp::{
-    copy_text, insert_text, start_command_hotkey, start_dictation_hotkey, HotkeyEvent,
-    HotkeyRegistration, InsertionOutcome,
+    copy_text, insert_text, set_launch_at_login, start_command_hotkey, start_dictation_hotkey,
+    HotkeyEvent, HotkeyRegistration, InsertionOutcome,
 };
 
 mod execute;
@@ -35,8 +35,11 @@ mod tests {
     #[test]
     fn preview_builds_report_windows_only_hotkeys_and_insertion() {
         let (sender, _receiver) = mpsc::channel();
-        assert!(start_dictation_hotkey(sender.clone(), Arc::new(|| {})).is_err());
-        assert!(start_command_hotkey(sender, Arc::new(|| {})).is_err());
+        let dictation = jarvis_core::Hotkey::parse("Ctrl+Shift+D").unwrap();
+        let command = jarvis_core::Hotkey::parse("Ctrl+Shift+A").unwrap();
+        assert!(start_dictation_hotkey(sender.clone(), Arc::new(|| {}), dictation).is_err());
+        assert!(start_command_hotkey(sender, Arc::new(|| {}), command).is_err());
+        assert!(set_launch_at_login(true).is_err());
         assert!(insert_text("hello").is_err());
         assert!(copy_text("hello").is_err());
     }

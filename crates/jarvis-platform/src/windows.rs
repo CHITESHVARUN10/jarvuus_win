@@ -17,8 +17,8 @@ use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, SendInput, UnregisterHotKey, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VIRTUAL_KEY, VK_A,
-    VK_CONTROL, VK_D, VK_V,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
+    VIRTUAL_KEY, VK_CONTROL, VK_V,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetMessageW, PostThreadMessageW, MSG, WM_HOTKEY, WM_QUIT,
@@ -26,11 +26,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use winreg::enums::HKEY_CURRENT_USER;
 use winreg::RegKey;
 
+use jarvis_core::hotkey::Hotkey;
 use jarvis_core::setup::{Consent, GpuAdapter, GpuInfo, MicrophoneAccess};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const MICROPHONE_KEY: &str =
     r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone";
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
 pub fn microphone() -> MicrophoneAccess {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -174,39 +176,49 @@ impl Drop for HotkeyRegistration {
 pub fn start_dictation_hotkey(
     sender: Sender<HotkeyEvent>,
     waker: crate::Wake,
+    hotkey: Hotkey,
 ) -> Result<HotkeyRegistration, String> {
-    start_hotkey(sender, waker, 1, VK_D, "Ctrl+Shift+D", HotkeyEvent::Pressed)
+    start_hotkey(sender, waker, 1, hotkey, HotkeyEvent::Pressed)
 }
 
 pub fn start_command_hotkey(
     sender: Sender<HotkeyEvent>,
     waker: crate::Wake,
+    hotkey: Hotkey,
 ) -> Result<HotkeyRegistration, String> {
-    start_hotkey(
-        sender,
-        waker,
-        2,
-        VK_A,
-        "Ctrl+Shift+A",
-        HotkeyEvent::CommandPressed,
-    )
+    start_hotkey(sender, waker, 2, hotkey, HotkeyEvent::CommandPressed)
 }
 
 fn start_hotkey(
     sender: Sender<HotkeyEvent>,
     waker: crate::Wake,
     id: i32,
-    key: VIRTUAL_KEY,
-    label: &'static str,
+    hotkey: Hotkey,
     event: HotkeyEvent,
 ) -> Result<HotkeyRegistration, String> {
+    let label = hotkey.format();
+    let thread_label = label.clone();
     let (ready, readiness) = mpsc::channel();
     let join = thread::spawn(move || {
         let thread_id = unsafe { GetCurrentThreadId() };
-        let modifiers = MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT;
-        if let Err(error) = unsafe { RegisterHotKey(None, id, modifiers, key.0 as u32) } {
+        let mut modifiers = MOD_NOREPEAT;
+        if hotkey.ctrl {
+            modifiers |= MOD_CONTROL;
+        }
+        if hotkey.shift {
+            modifiers |= MOD_SHIFT;
+        }
+        if hotkey.alt {
+            modifiers |= MOD_ALT;
+        }
+        if hotkey.win {
+            modifiers |= MOD_WIN;
+        }
+        if let Err(error) =
+            unsafe { RegisterHotKey(None, id, modifiers, u32::from(hotkey.vk_code())) }
+        {
             let _ = ready.send(Err(format!(
-                "Could not register {label}: {error}. Another app may already use it."
+                "Could not register {thread_label}: {error}. Another app may already use it."
             )));
             return;
         }
@@ -240,6 +252,25 @@ fn start_hotkey(
             Err(error)
         }
         Err(_) => Err(format!("Timed out while registering {label}.")),
+    }
+}
+
+pub fn set_launch_at_login(enabled: bool) -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (run, _) = hkcu
+        .create_subkey(RUN_KEY)
+        .map_err(|error| format!("Could not open the startup registry key: {error}"))?;
+    if enabled {
+        let command = format!("\"{}\"", executable.display());
+        run.set_value("Jarvis", &command)
+            .map_err(|error| format!("Could not enable launch at login: {error}"))
+    } else {
+        match run.delete_value("Jarvis") {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("Could not disable launch at login: {error}")),
+        }
     }
 }
 

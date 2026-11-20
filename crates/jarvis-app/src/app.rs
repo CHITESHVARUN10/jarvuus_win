@@ -1,15 +1,101 @@
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
+use jarvis_core::hotkey::{Hotkey, HotkeyKey};
+use jarvis_core::insights::Insights;
 use jarvis_core::logging;
 use jarvis_core::models;
 use jarvis_core::paths::AppPaths;
+use jarvis_core::routines::RoutineStore;
 use jarvis_core::settings::{AppSettings, ThemeChoice};
 use jarvis_core::setup::{SetupAction, SetupItem, SetupKind, SetupReport, SetupStatus};
 use jarvis_models::manager::{ModelKind, ModelManager, ModelPhase, ModelUpdate};
 use jarvis_platform::{HotkeyEvent, HotkeyRegistration, InsertionOutcome};
 use jarvis_speech::{DictationController, DictationState, SpeechEvent};
-use rune::{TextEdit, Tx, Waker};
+use rune::{AppHandle, Key, KeyEvent, TextEdit, Tx, Waker, WindowHandle};
+
+static WINDOW_HANDLE: OnceLock<WindowHandle> = OnceLock::new();
+static APP_HANDLE: OnceLock<AppHandle<Jarvis>> = OnceLock::new();
+
+pub fn remember_window(handle: WindowHandle) {
+    let _ = WINDOW_HANDLE.set(handle);
+    if let Some(app) = APP_HANDLE.get() {
+        app.wake();
+    }
+}
+
+pub fn remember_app_handle(handle: AppHandle<Jarvis>) {
+    let _ = APP_HANDLE.set(handle);
+}
+
+pub fn on_close(state: &mut Jarvis, tx: &mut Tx) {
+    if !state.settings.close_to_tray || state.tray.is_none() {
+        tx.quit();
+    }
+}
+
+pub fn on_key(state: &mut Jarvis, event: &KeyEvent, _tx: &mut Tx) -> bool {
+    if state.hotkey_target.is_none() {
+        return false;
+    }
+    if matches!(event.key, Key::Escape) {
+        state.cancel_hotkey_capture();
+        return true;
+    }
+    match hotkey_from_event(event) {
+        Some(hotkey) => state.apply_hotkey(hotkey),
+        None => {
+            state.hotkey_message =
+                Some("Use Ctrl, Shift, Alt or Win plus a letter, digit, F-key or Space.".into());
+        }
+    }
+    true
+}
+
+fn hotkey_from_event(event: &KeyEvent) -> Option<Hotkey> {
+    let ctrl = event.mods.ctrl || event.mods.cmd;
+    let shift = event.mods.shift;
+    let alt = event.mods.alt;
+    let win = event.mods.logo;
+    if !(ctrl || shift || alt || win) {
+        return None;
+    }
+    let key = match &event.key {
+        Key::Command(character) => {
+            if *character == ' ' {
+                HotkeyKey::Space
+            } else if character.is_ascii_alphanumeric() {
+                HotkeyKey::Character(character.to_ascii_uppercase())
+            } else {
+                return None;
+            }
+        }
+        Key::Text(text) => {
+            let mut characters = text.chars();
+            let character = characters.next()?;
+            if characters.next().is_some() {
+                return None;
+            }
+            if character == ' ' {
+                HotkeyKey::Space
+            } else if character.is_ascii_alphanumeric() {
+                HotkeyKey::Character(character.to_ascii_uppercase())
+            } else {
+                return None;
+            }
+        }
+        Key::Function(number) if (1..=24).contains(number) => HotkeyKey::Function(*number),
+        _ => return None,
+    };
+    Some(Hotkey {
+        ctrl,
+        shift,
+        alt,
+        win,
+        key,
+    })
+}
 
 use crate::command::{CommandEvent, CommandService, CommandUi};
 
@@ -153,6 +239,28 @@ pub enum SpeechMode {
     Command,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HotkeyTarget {
+    Dictation,
+    Command,
+}
+
+impl HotkeyTarget {
+    pub fn label(self) -> &'static str {
+        match self {
+            HotkeyTarget::Dictation => "Dictation",
+            HotkeyTarget::Command => "Command",
+        }
+    }
+
+    pub fn setting(self) -> &'static str {
+        match self {
+            HotkeyTarget::Dictation => "dictation",
+            HotkeyTarget::Command => "command",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SpeechUi {
     pub session: u64,
@@ -176,7 +284,7 @@ impl SpeechUi {
             session: 0,
             mode: SpeechMode::Dictate,
             state: DictationState::Idle,
-            detail: "Press Ctrl + Shift + D or Start to dictate.".into(),
+            detail: "Press the dictation hotkey or Start to dictate.".into(),
             level: 0.0,
             partial: String::new(),
             transcript: None,
@@ -291,8 +399,22 @@ pub struct Jarvis {
     pub speech: SpeechUi,
     pub dictation: DictationController,
     pub command: CommandUi,
+    pub routines: RoutineStore,
+    pub routine_name: TextEdit,
+    pub routine_command: TextEdit,
+    pub routine_error: Option<String>,
+    pub insights: Insights,
+    pub hotkey_target: Option<HotkeyTarget>,
+    pub hotkey_message: Option<String>,
     pub hotkey: Option<HotkeyRegistration>,
     pub command_hotkey: Option<HotkeyRegistration>,
+    pub tray: Option<rune::Tray>,
+    pub tray_error: Option<String>,
+    #[allow(dead_code)]
+    tray_tx: mpsc::Sender<String>,
+    tray_rx: Receiver<String>,
+    #[allow(dead_code)]
+    tray_attempted: bool,
     command_service: CommandService,
     command_rx: Receiver<CommandEvent>,
     rx: Option<Receiver<SetupReport>>,
@@ -343,6 +465,9 @@ impl Jarvis {
         let (hotkey_tx, hotkey_rx) = mpsc::channel();
         let command = CommandUi::new();
         let (command_service, command_rx) = CommandService::new(paths.clone());
+        let routines = RoutineStore::load(&paths.routines_file);
+        let insights = Insights::load(&paths.insights_file);
+        let (tray_tx, tray_rx) = mpsc::channel();
 
         Self {
             paths,
@@ -359,8 +484,20 @@ impl Jarvis {
             speech,
             dictation,
             command,
+            routines,
+            routine_name: TextEdit::default(),
+            routine_command: TextEdit::default(),
+            routine_error: None,
+            insights,
+            hotkey_target: None,
+            hotkey_message: None,
             hotkey: None,
             command_hotkey: None,
+            tray: None,
+            tray_error: None,
+            tray_tx,
+            tray_rx,
+            tray_attempted: false,
             command_service,
             command_rx,
             rx: None,
@@ -400,6 +537,9 @@ impl Jarvis {
         let (hotkey_tx, hotkey_rx) = mpsc::channel();
         let command = CommandUi::new();
         let (command_service, command_rx) = CommandService::new(paths.clone());
+        let routines = RoutineStore::load(&paths.routines_file);
+        let insights = Insights::load(&paths.insights_file);
+        let (tray_tx, tray_rx) = mpsc::channel();
         Self {
             paths,
             settings,
@@ -423,8 +563,20 @@ impl Jarvis {
             speech,
             dictation,
             command,
+            routines,
+            routine_name: TextEdit::default(),
+            routine_command: TextEdit::default(),
+            routine_error: None,
+            insights,
+            hotkey_target: None,
+            hotkey_message: None,
             hotkey: None,
             command_hotkey: None,
+            tray: None,
+            tray_error: None,
+            tray_tx,
+            tray_rx,
+            tray_attempted: false,
             command_service,
             command_rx,
             rx: None,
@@ -603,11 +755,26 @@ impl Jarvis {
     }
 
     pub fn run_command_text(&mut self, text: String) {
-        if self.command.busy {
-            return;
-        }
         let text = text.trim().to_string();
         if text.is_empty() {
+            return;
+        }
+        let text = self.resolve_routine_command(&text).unwrap_or(text);
+        self.enqueue_command_text(text);
+    }
+
+    fn resolve_routine_command(&self, text: &str) -> Option<String> {
+        let lower = text.trim().to_ascii_lowercase();
+        let candidate = lower.strip_prefix("run ").unwrap_or(&lower);
+        self.routines
+            .routines
+            .iter()
+            .find(|routine| routine.name.eq_ignore_ascii_case(candidate))
+            .map(|routine| routine.command.clone())
+    }
+
+    fn enqueue_command_text(&mut self, text: String) {
+        if self.command.busy {
             return;
         }
         self.section = Section::Assistant;
@@ -638,12 +805,187 @@ impl Jarvis {
         }
     }
 
-    pub fn register_command_hotkey(&mut self) {
+    pub fn add_routine(&mut self) {
+        let name = self.routine_name.text.trim().to_string();
+        let command = self.routine_command.text.trim().to_string();
+        match self.routines.add(&name, &command) {
+            Ok(_) => {
+                self.routine_name = TextEdit::new("");
+                self.routine_command = TextEdit::new("");
+                self.routine_error = None;
+                self.save_routines();
+                self.notice = Some(Notice::info(format!("Saved the routine '{name}'.")));
+            }
+            Err(error) => self.routine_error = Some(error),
+        }
+    }
+
+    pub fn delete_routine(&mut self, index: usize) {
+        if let Some(routine) = self.routines.remove(index) {
+            self.save_routines();
+            self.notice = Some(Notice::info(format!(
+                "Removed the routine '{}'.",
+                routine.name
+            )));
+        }
+    }
+
+    pub fn run_routine(&mut self, index: usize) {
+        let Some(routine) = self.routines.routines.get(index).cloned() else {
+            return;
+        };
+        if self.command.busy {
+            self.notice = Some(Notice::info("Another command is still running."));
+            return;
+        }
+        self.enqueue_command_text(routine.command);
+    }
+
+    fn save_routines(&mut self) {
+        if let Err(error) = self.routines.save_atomic(&self.paths.routines_file) {
+            self.routine_error = Some(format!("Could not save routines: {error}"));
+        }
+    }
+
+    fn save_insights(&mut self) {
+        if let Err(error) = self.insights.save_atomic(&self.paths.insights_file) {
+            logging::warn(
+                &self.paths.log_file,
+                &format!("insights save failed: {error}"),
+            );
+        }
+    }
+
+    pub fn set_launch_at_login(&mut self, enabled: bool) {
+        match jarvis_platform::set_launch_at_login(enabled) {
+            Ok(()) => {
+                self.settings.launch_at_login = enabled;
+                self.save_settings();
+                self.notice = Some(Notice::info(if enabled {
+                    "Jarvis will start when you sign in."
+                } else {
+                    "Jarvis will no longer start when you sign in."
+                }));
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(format!(
+                    "Could not update launch at login: {error}"
+                )));
+            }
+        }
+    }
+
+    pub fn set_close_to_tray(&mut self, enabled: bool) {
+        self.settings.close_to_tray = enabled;
+        self.save_settings();
+        self.notice = Some(Notice::info(if enabled {
+            "Closing the window keeps Jarvis in the tray."
+        } else {
+            "Closing the window will quit Jarvis."
+        }));
+    }
+
+    pub fn begin_hotkey_capture(&mut self, target: HotkeyTarget) {
+        self.section = Section::Settings;
+        self.settings_page = SettingsPage::General;
+        self.hotkey_target = Some(target);
+        self.hotkey_message = Some(format!(
+            "Press the new {} hotkey. Escape cancels.",
+            target.label().to_lowercase()
+        ));
+    }
+
+    pub fn cancel_hotkey_capture(&mut self) {
+        self.hotkey_target = None;
+        self.hotkey_message = None;
+    }
+
+    pub fn apply_hotkey(&mut self, hotkey: Hotkey) {
+        let Some(target) = self.hotkey_target else {
+            return;
+        };
+        let chord = hotkey.format();
+        let other = match target {
+            HotkeyTarget::Dictation => &self.settings.command_hotkey,
+            HotkeyTarget::Command => &self.settings.dictation_hotkey,
+        };
+        if Hotkey::parse(other).is_some_and(|other| other.format().eq_ignore_ascii_case(&chord)) {
+            self.hotkey_message = Some("Dictation and command hotkeys must be different.".into());
+            return;
+        }
+        let current = match target {
+            HotkeyTarget::Dictation => &self.settings.dictation_hotkey,
+            HotkeyTarget::Command => &self.settings.command_hotkey,
+        };
+        if Hotkey::parse(current)
+            .is_some_and(|current| current.format().eq_ignore_ascii_case(&chord))
+        {
+            self.hotkey_target = None;
+            self.hotkey_message = Some("Hotkey unchanged.".into());
+            return;
+        }
+
         let waker: Waker = self
             .waker
             .clone()
             .unwrap_or_else(|| std::sync::Arc::new(|| {}));
-        match jarvis_platform::start_command_hotkey(self.hotkey_tx.clone(), waker) {
+        let result = match target {
+            HotkeyTarget::Dictation => {
+                jarvis_platform::start_dictation_hotkey(self.hotkey_tx.clone(), waker, hotkey)
+            }
+            HotkeyTarget::Command => {
+                jarvis_platform::start_command_hotkey(self.hotkey_tx.clone(), waker, hotkey)
+            }
+        };
+        match result {
+            Ok(handle) => {
+                match target {
+                    HotkeyTarget::Dictation => {
+                        self.hotkey = Some(handle);
+                        self.settings.dictation_hotkey = chord.clone();
+                        self.speech.hotkey_error = None;
+                    }
+                    HotkeyTarget::Command => {
+                        self.command_hotkey = Some(handle);
+                        self.settings.command_hotkey = chord.clone();
+                        self.command.hotkey_error = None;
+                    }
+                }
+                self.hotkey_target = None;
+                self.hotkey_message = Some(format!("Hotkey set to {}.", hotkey.format()));
+                self.save_settings();
+                self.notice = Some(Notice::info(format!(
+                    "{} hotkey set to {}.",
+                    target.label(),
+                    hotkey.format()
+                )));
+            }
+            Err(error) => {
+                self.hotkey_message = Some(error.clone());
+                let has_handle = match target {
+                    HotkeyTarget::Dictation => self.hotkey.is_some(),
+                    HotkeyTarget::Command => self.command_hotkey.is_some(),
+                };
+                if !has_handle {
+                    match target {
+                        HotkeyTarget::Dictation => self.speech.hotkey_error = Some(error),
+                        HotkeyTarget::Command => self.command.hotkey_error = Some(error),
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn register_command_hotkey(&mut self) {
+        let Some(hotkey) = Hotkey::parse(&self.settings.command_hotkey) else {
+            self.command.hotkey_error = Some("The saved command hotkey is not valid.".into());
+            return;
+        };
+        let waker: Waker = self
+            .waker
+            .clone()
+            .unwrap_or_else(|| std::sync::Arc::new(|| {}));
+        match jarvis_platform::start_command_hotkey(self.hotkey_tx.clone(), waker, hotkey) {
             Ok(handle) => {
                 self.command_hotkey = Some(handle);
                 self.command.hotkey_error = None;
@@ -653,16 +995,89 @@ impl Jarvis {
     }
 
     pub fn register_hotkey(&mut self) {
+        let Some(hotkey) = Hotkey::parse(&self.settings.dictation_hotkey) else {
+            self.speech.hotkey_error = Some("The saved dictation hotkey is not valid.".into());
+            return;
+        };
         let waker: Waker = self
             .waker
             .clone()
             .unwrap_or_else(|| std::sync::Arc::new(|| {}));
-        match jarvis_platform::start_dictation_hotkey(self.hotkey_tx.clone(), waker) {
+        match jarvis_platform::start_dictation_hotkey(self.hotkey_tx.clone(), waker, hotkey) {
             Ok(handle) => {
                 self.hotkey = Some(handle);
                 self.speech.hotkey_error = None;
             }
             Err(error) => self.speech.hotkey_error = Some(error),
+        }
+    }
+
+    fn ensure_tray(&mut self) -> bool {
+        #[cfg(not(windows))]
+        {
+            let _ = self.tray_attempted;
+            false
+        }
+        #[cfg(windows)]
+        {
+            if self.tray.is_some() || self.tray_attempted {
+                return false;
+            }
+            let Some(handle) = window_handle() else {
+                return false;
+            };
+            self.tray_attempted = true;
+            let menu = vec![
+                rune::TrayItem::action("open", "Open Jarvis"),
+                rune::TrayItem::Separator,
+                rune::TrayItem::action("dictate", "Dictate"),
+                rune::TrayItem::action("command", "Command"),
+                rune::TrayItem::action("settings", "Settings"),
+                rune::TrayItem::Separator,
+                rune::TrayItem::action("quit", "Quit Jarvis"),
+            ];
+            let spec = rune::TraySpec::new("com.chiteshvarun.jarvis", "Jarvis", tray_icon())
+                .tooltip("Jarvis — local voice assistant")
+                .menu(menu);
+            let sender = std::sync::Arc::new(std::sync::Mutex::new(self.tray_tx.clone()));
+            let waker = self.waker.clone();
+            let app_handle = app_handle();
+            let result = rune::Tray::new(spec, move |event| match event {
+                rune::TrayEvent::Activate { .. } => handle.open(),
+                rune::TrayEvent::Menu(id) => {
+                    if id == "open" {
+                        handle.open();
+                        return;
+                    }
+                    if id == "quit" {
+                        if let Some(app) = &app_handle {
+                            app.quit();
+                            return;
+                        }
+                    }
+                    if id == "settings" {
+                        handle.open();
+                    }
+                    if let Ok(sender) = sender.lock() {
+                        let _ = sender.send(id);
+                    }
+                    if let Some(waker) = &waker {
+                        waker();
+                    }
+                }
+                _ => {}
+            });
+            match result {
+                Ok(tray) => {
+                    self.tray = Some(tray);
+                    self.tray_error = None;
+                }
+                Err(error) => {
+                    self.tray_error = Some(error.to_string());
+                    logging::warn(&self.paths.log_file, &format!("tray unavailable: {error}"));
+                }
+            }
+            true
         }
     }
 
@@ -896,8 +1311,9 @@ pub fn setup_hook(state: &mut Jarvis, waker: Waker) {
     state.start_setup_probe(waker);
 }
 
-pub fn poll(state: &mut Jarvis, _clock: f64, _tx: &mut Tx) -> bool {
+pub fn poll(state: &mut Jarvis, _clock: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
+    changed |= state.ensure_tray();
     while let Ok(update) = state.model_rx.try_recv() {
         state.apply_model_update(update);
         changed = true;
@@ -918,7 +1334,21 @@ pub fn poll(state: &mut Jarvis, _clock: f64, _tx: &mut Tx) -> bool {
         changed = true;
     }
     while let Ok(event) = state.command_rx.try_recv() {
+        if let CommandEvent::Done { record } = &event {
+            state.insights.record(&record.source, record.ok);
+            state.save_insights();
+        }
         state.command.apply(event);
+        changed = true;
+    }
+    while let Ok(action) = state.tray_rx.try_recv() {
+        match action.as_str() {
+            "dictate" => state.toggle_dictation(),
+            "command" => state.begin_command_dictation(),
+            "settings" => state.open_settings(SettingsPage::General),
+            "quit" => tx.quit(),
+            _ => {}
+        }
         changed = true;
     }
 
@@ -936,6 +1366,45 @@ pub fn poll(state: &mut Jarvis, _clock: f64, _tx: &mut Tx) -> bool {
         }
         Some(Err(TryRecvError::Empty)) | None => changed,
     }
+}
+
+#[cfg(windows)]
+fn window_handle() -> Option<WindowHandle> {
+    WINDOW_HANDLE.get().cloned()
+}
+
+#[cfg(windows)]
+fn app_handle() -> Option<AppHandle<Jarvis>> {
+    APP_HANDLE.get().cloned()
+}
+
+#[cfg(windows)]
+fn tray_icon() -> rune::TrayIcon {
+    const SIZE: u32 = 32;
+    let mut pixels = vec![0_u8; (SIZE * SIZE * 4) as usize];
+    let center = (SIZE as f32 - 1.0) / 2.0;
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let dx = x as f32 - center;
+            let dy = y as f32 - center;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let alpha = ((center - distance).clamp(0.0, 1.0) * 255.0) as u8;
+            if alpha == 0 {
+                continue;
+            }
+            let offset = ((y * SIZE + x) * 4) as usize;
+            let (red, green, blue) = if distance <= 4.5 {
+                (255, 255, 255)
+            } else {
+                (74, 143, 247)
+            };
+            pixels[offset] = red;
+            pixels[offset + 1] = green;
+            pixels[offset + 2] = blue;
+            pixels[offset + 3] = alpha;
+        }
+    }
+    rune::TrayIcon::rgba(SIZE, SIZE, pixels)
 }
 
 #[cfg(test)]
@@ -979,6 +1448,67 @@ mod tests {
         assert_eq!(state.section, Section::Assistant);
         assert!(state.settings.setup_completed);
         assert!(AppSettings::load(&paths.settings_file).setup_completed);
+    }
+
+    #[test]
+    fn hotkey_capture_normalizes_chords() {
+        let event = KeyEvent {
+            key: Key::Command('d'),
+            mods: rune::Mods {
+                ctrl: true,
+                cmd: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(hotkey_from_event(&event).unwrap().format(), "Ctrl+D");
+
+        let function = KeyEvent {
+            key: Key::Function(5),
+            mods: rune::Mods {
+                ctrl: true,
+                alt: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            hotkey_from_event(&function).unwrap().format(),
+            "Ctrl+Alt+F5"
+        );
+
+        let plain = KeyEvent {
+            key: Key::Command('x'),
+            mods: rune::Mods::default(),
+        };
+        assert!(hotkey_from_event(&plain).is_none());
+    }
+
+    #[test]
+    fn routines_and_tray_settings_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_data_dir(dir.path());
+        let mut state = Jarvis::with_state(paths.clone(), AppSettings::default());
+        state.routine_name = TextEdit::new("Focus");
+        state.routine_command = TextEdit::new("open chrome and open vscode");
+        state.add_routine();
+        assert_eq!(state.routines.routines.len(), 1);
+        assert_eq!(
+            jarvis_core::RoutineStore::load(&paths.routines_file)
+                .routines
+                .len(),
+            1
+        );
+
+        state.set_close_to_tray(false);
+        assert!(!AppSettings::load(&paths.settings_file).close_to_tray);
+        assert_eq!(
+            state.resolve_routine_command("focus").as_deref(),
+            Some("open chrome and open vscode")
+        );
+        assert_eq!(
+            state.resolve_routine_command("run Focus").as_deref(),
+            Some("open chrome and open vscode")
+        );
+        assert!(state.resolve_routine_command("something else").is_none());
     }
 
     #[test]

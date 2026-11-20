@@ -18,8 +18,9 @@ crates/jarvis-app
 ```
 
 - **jarvis-core** has no windowing or OS calls. It owns `AppPaths`,
-  `AppSettings`, the setup report model, model file status, logging and the
-  Ollama probe. All of it is unit-tested off Windows.
+  `AppSettings`, the setup report model, model file status, logging, the Ollama
+  probe, hotkey parsing, routine storage and command insights. All of it is
+  unit-tested off Windows.
 - **jarvis-commands** is the portable command layer: clean/validate, safety,
   fast-path and rule planning, strict intent-JSON mapping, URL/browser targets,
   file-query interpretation and the Ollama tools prompt/parser. It has no window
@@ -37,7 +38,9 @@ crates/jarvis-app
   depends on core and the model crate's `WhisperEngine`.
 - **jarvis-app** owns the Rune view, navigation, first-run gating, the setup probe,
   the model/speech/command channels and the command worker. The worker owns the
-  lazy intent engine and executes actions off the UI thread.
+  lazy intent engine and executes actions off the UI thread. The app also owns
+  routines/insights state, the tray lifecycle (`keep_running`, `on_ready`,
+  `on_close`) and the global-hotkey recorder.
 
 The app runs on macOS as a UI preview; Windows-only probes report a preview
 notice and the data directory is `JarvisWindows` to avoid touching a real macOS
@@ -56,14 +59,17 @@ main
             └─ write launch line to logs/commands.log
        └─ first frame (setup rows show "Checking")
        ├─ model manager, speech, command, hotkey and insertion channels
+       └─ App::new(spec).keep_running().on_close(..).on_ready(handle)
        └─ AppSpec::setup
             ├─ store the Rune waker; attach model, dictation and command notifiers
-            ├─ register Ctrl+Shift+D and Ctrl+Shift+A (Windows)
+            ├─ register the saved dictation and command hotkeys (Windows)
             └─ spawn probe thread → SetupReport → wake
        └─ AppSpec::poll
+            ├─ create the tray once the first-frame WindowHandle exists
             ├─ drain ModelUpdate events → setup rows, essentials, progress
             ├─ drain SpeechEvent, HotkeyEvent and insertion results
-            ├─ drain CommandEvent → result card, history, busy state
+            ├─ drain CommandEvent → result card, history, insights
+            ├─ drain tray actions → dictate, command, settings, quit
             └─ drain SetupReport → baseline setup status
 ```
 
@@ -111,11 +117,13 @@ Windows has no Accessibility or Automation grant equivalent to macOS.
   process cannot inject into an elevated foreground window (UIPI). `SendInput`
   returning zero leaves the transcript on the clipboard and reports
   `ClipboardOnly` instead of pretending the paste worked.
-- **Global hotkeys.** `RegisterHotKey` needs no permission. `Ctrl+Shift+D`
-  (dictate) and `Ctrl+Shift+A` (command) run on separate message-loop threads
-  with `MOD_NOREPEAT`; each registration has its own retry/status.
-- **Launch at login.** Planned `HKCU\...\Run` or MSIX startup task; the system
-  remains the source of truth and is re-read after toggling.
+- **Global hotkeys.** `RegisterHotKey` needs no permission. Dictation and command
+  hotkeys run on separate message-loop threads with `MOD_NOREPEAT`; each chord is
+  parsed by `jarvis-core`, validated, registered before it is saved, and has its
+  own retry/status. Defaults are `Ctrl+Shift+D` and `Ctrl+Shift+A`.
+- **Launch at login.** The Settings toggle writes the current executable to
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`; disabling removes it. The
+  launch is visible; a silent-background launch is deferred.
 
 The macOS accessibility FFI, permission prompts, AppleScript automation errors
 and `-1743` handling have no Windows equivalent and are not ported.
@@ -126,7 +134,9 @@ and `-1743` handling have no Windows equivalent and are not ported.
 
 | Path | Purpose |
 | --- | --- |
-| `settings.json` | Theme, accent, setup completion, hotkey choices |
+| `settings.json` | Theme, accent, setup completion, hotkeys, startup, tray |
+| `routines.json` | Named compound commands |
+| `insights.json` | Command totals, branch counts and daily buckets |
 | `logs/commands.log` | Append-only app/setup log |
 | `models/ggml-large-v3-turbo.bin` | Whisper model |
 | `models/ggml-large-v3-turbo.bin.part` | Resumable speech download |
@@ -243,17 +253,18 @@ emitting a final. Every app event carries the session id; the app drops stale
 events. `abort` is the error path: it tears down capture without overwriting the
 error state with an idle event.
 
-**Hotkey and insertion.** A dedicated Windows thread registers
-`Ctrl+Shift+D` with `MOD_NOREPEAT`, pumps `WM_HOTKEY`, and wakes Rune through the
-app's waker. Registration failure is surfaced with a retry. Automatic insertion
+**Hotkey and insertion.** A dedicated Windows thread registers the saved dictation
+chord with `MOD_NOREPEAT`, pumps `WM_HOTKEY`, and wakes Rune through the app's
+waker. Registration failure is surfaced with a retry; Settings → General records
+a replacement and registers it before saving. Automatic insertion
 snapshots the text clipboard, writes the transcript, sends Ctrl+V with
 `SendInput`, and restores the snapshot only if the clipboard still holds the
 transcript. If `SendInput` returns zero (elevated target/UIPI), the transcript is
 left on the clipboard and the UI says so. The clipboard snapshot is text-only.
 
 The macOS Apple `SpeechAnalyzer` path and Porcupine wake word are not part of the
-Windows plan. Live listening is Whisper-only. A floating dictation pill, tray
-state and configurable hotkeys arrive with Phase 5.
+Windows plan. Live listening is Whisper-only. A floating dictation pill and
+silent-background startup remain deferred.
 
 ## Command pipeline (implemented)
 
@@ -311,6 +322,45 @@ without Ollama, unknown free-form input gets a local-only explanation.
 The command hotkey starts the same dictation pipeline in command mode: the final
 Whisper transcript goes to the command worker instead of the clipboard/paste
 path. Typed commands use the same worker and result model.
+
+## Routines, insights, tray and hotkeys
+
+**Routines.** `RoutineStore` in `jarvis-core` persists a bounded list of
+`{name, command}` entries in `routines.json` with atomic writes and duplicate-name
+validation. The page splits the command with the same conjunction splitter used by
+speech, shows the ordered steps, and Run sends the whole command through the normal
+command worker, so safety, model fallback and result rendering are identical to
+typed input. The command dispatcher also resolves an exact routine name, or
+`run <name>`, before planning. Delete is immediate and local.
+
+**Insights.** The command worker emits one `CommandRecord` per finished command.
+The app increments `Insights` before updating the result card: total,
+succeeded/failed, the deciding branch (Rules, Intent model, Ollama or Local) and a
+daily bucket. The history is capped at 90 days and stored in `insights.json`.
+The Insights page derives a seven-day series and branch bars from this local data;
+no command text, audio or model request is uploaded. Failed plans are counted.
+
+**Tray.** Rune's `Tray` uses `Shell_NotifyIcon` on its own message-only window.
+The app builds it after the first frame from the stored `WindowHandle`, with a
+generated RGBA icon and Open/Dictate/Command/Settings/Quit items. The main window
+uses `App::keep_running()`; `on_close` quits only when close-to-tray is off or the
+tray failed. Opening recreates the window with the same `Jarvis` state. Tray
+Dictate and Command deliberately do not focus the window so paste/output stays in
+the previously active app. Quit goes through `AppHandle::quit`.
+
+**Hotkeys.** `jarvis-core::hotkey` parses and formats chords and maps keys to
+Win32 virtual-key codes. The Settings recorder captures the next chord through
+`AppSpec::on_key`, rejects modifier-only/unknown keys and collisions, registers the
+candidate while the old registration is still live, and only then saves. On
+success the old `HotkeyRegistration` is dropped and its thread unregisters; on
+failure the old chord keeps working.
+
+**Startup.** `set_launch_at_login` writes or removes the user's Run value. The
+launch opens the window normally. The macOS login-item approval flow has no
+Windows equivalent.
+
+**Deferred.** Silent-background login launch, per-routine voice triggers, insights
+export/upload and a floating dictation pill.
 
 ## CI
 

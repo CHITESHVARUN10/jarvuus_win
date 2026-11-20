@@ -1,3 +1,6 @@
+use jarvis_commands::planner;
+use jarvis_core::hotkey::display_chord;
+use jarvis_core::insights::weekday_short;
 use jarvis_core::models;
 use jarvis_core::setup::{SetupItem, SetupStatus};
 use jarvis_core::ThemeChoice;
@@ -6,7 +9,7 @@ use jarvis_speech::DictationState;
 use rune::tok::{self, radius, space, type_, Theme};
 use rune::{col, el, oklch, row, text, text_input, Color, Cx, El, ScrollSpec, TextStyle};
 
-use crate::{Jarvis, Notice, NoticeTone, Section, SettingsPage};
+use crate::{HotkeyTarget, Jarvis, Notice, NoticeTone, Section, SettingsPage};
 
 const PAGE_PAD: f32 = 28.0;
 
@@ -52,7 +55,8 @@ fn main(state: &Jarvis, p: Paint) -> El {
     let page = match state.section {
         Section::Assistant => assistant_page(state, p),
         Section::Voice => voice_page(state, p),
-        Section::Routines | Section::Insights => placeholder_page(state.section, p),
+        Section::Routines => routines_page(state, p),
+        Section::Insights => insights_page(state, p),
         Section::Appearance => appearance_page(state, p),
         Section::Settings => settings_page(state, p),
     };
@@ -315,7 +319,7 @@ fn sidebar_footer(state: &Jarvis, p: Paint) -> El {
                 .justify_between()
                 .gap(10.0)
                 .child(
-                    text(format!("v{} · phase 4", state.version))
+                    text(format!("v{} · phase 5", state.version))
                         .font(TextStyle::new(11.0, 500.0))
                         .color(p.t.text_secondary),
                 )
@@ -379,7 +383,7 @@ fn assistant_page(state: &Jarvis, p: Paint) -> El {
                                 .child(hotkey_chip(
                                     p,
                                     "assistant-command-hotkey",
-                                    "Ctrl + Shift + A",
+                                    &display_chord(&state.settings.command_hotkey),
                                 ))
                                 .child(
                                     text(if state.command.hotkey_error.is_some() {
@@ -1296,7 +1300,7 @@ fn voice_page(state: &Jarvis, p: Paint) -> El {
                                         .fill(p.t.control_track)
                                         .center()
                                         .child(
-                                            text("Ctrl + Shift + D")
+                                            text(display_chord(&state.settings.dictation_hotkey))
                                                 .font(type_::MONO_CAPTION)
                                                 .color(p.t.text),
                                         ),
@@ -1395,7 +1399,10 @@ fn voice_page(state: &Jarvis, p: Paint) -> El {
             card(p, "voice-help-card")
                 .child(section_heading(p, "How dictation works"))
                 .child(
-                    text("Press Ctrl + Shift + D anywhere to start, then press it again to stop. The transcript is pasted into the window you were using.")
+                    text(format!(
+                        "Press {} anywhere to start, then press it again to stop. The transcript is pasted into the window you were using.",
+                        display_chord(&state.settings.dictation_hotkey)
+                    ))
                         .font(type_::BODY)
                         .color(p.t.text_secondary),
                 )
@@ -1421,6 +1428,8 @@ fn general_page(state: &Jarvis, p: Paint) -> El {
         .w_full()
         .max_w(820.0)
         .gap(16.0)
+        .child(startup_card(state, p))
+        .child(hotkeys_card(state, p))
         .child(
             card(p, "storage-card")
                 .child(section_heading(p, "Storage"))
@@ -1473,6 +1482,199 @@ fn general_page(state: &Jarvis, p: Paint) -> El {
                         )),
                 ),
         )
+}
+
+fn startup_card(state: &Jarvis, p: Paint) -> El {
+    let windows = cfg!(windows);
+    let tray_status = if !windows {
+        (
+            "System tray is available on Windows.".to_string(),
+            p.t.text_secondary,
+        )
+    } else if let Some(error) = &state.tray_error {
+        (format!("Tray unavailable · {error}"), warning_color())
+    } else if state.tray.is_some() {
+        ("System tray icon active.".to_string(), success_color())
+    } else {
+        (
+            "System tray starts after the first frame.".to_string(),
+            p.t.text_secondary,
+        )
+    };
+
+    card(p, "startup-card")
+        .child(section_heading(p, "Startup & tray"))
+        .child(startup_row(
+            p,
+            "toggle-launch-at-login",
+            "Launch at login",
+            if windows {
+                "Start Jarvis when you sign in."
+            } else {
+                "Windows only."
+            },
+            state.settings.launch_at_login,
+            windows,
+            |state| {
+                let next = !state.settings.launch_at_login;
+                state.set_launch_at_login(next);
+            },
+        ))
+        .child(startup_row(
+            p,
+            "toggle-close-to-tray",
+            "Close to tray",
+            if windows {
+                "Closing the window leaves Jarvis running in the tray."
+            } else {
+                "Windows only."
+            },
+            state.settings.close_to_tray,
+            windows,
+            |state| {
+                let next = !state.settings.close_to_tray;
+                state.set_close_to_tray(next);
+            },
+        ))
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .center_y()
+                .child(
+                    el().size(7.0, 7.0)
+                        .radius(3.5)
+                        .fill(tray_status.1)
+                        .a11y_hidden(),
+                )
+                .child(text(tray_status.0).font(type_::LABEL).color(tray_status.1)),
+        )
+}
+
+fn startup_row(
+    p: Paint,
+    key: &str,
+    title: &str,
+    detail: &str,
+    on: bool,
+    enabled: bool,
+    on_press: impl Fn(&mut Jarvis) + 'static,
+) -> El {
+    row()
+        .w_full()
+        .gap(16.0)
+        .center_y()
+        .justify_between()
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(2.0)
+                .child(text(title).font(type_::BODY).color(p.t.text))
+                .child(text(detail).font(type_::LABEL).color(p.t.text_secondary)),
+        )
+        .child(toggle_switch(p, key, on, enabled, on_press))
+}
+
+fn hotkeys_card(state: &Jarvis, p: Paint) -> El {
+    let mut card = card(p, "hotkeys-card")
+        .child(section_heading(p, "Hotkeys"))
+        .child(
+            text("Click Record, then press a chord. A modifier plus a letter, digit, F-key or Space works.")
+                .font(type_::LABEL)
+                .color(p.t.text_secondary),
+        )
+        .child(hotkey_setting_row(
+            state,
+            p,
+            HotkeyTarget::Dictation,
+            &state.settings.dictation_hotkey,
+            &state.speech.hotkey_error,
+        ))
+        .child(hotkey_setting_row(
+            state,
+            p,
+            HotkeyTarget::Command,
+            &state.settings.command_hotkey,
+            &state.command.hotkey_error,
+        ));
+
+    if let Some(message) = &state.hotkey_message {
+        card = card.child(text(message).font(type_::LABEL).color(
+            if state.hotkey_target.is_some() {
+                warning_color()
+            } else {
+                success_color()
+            },
+        ));
+    }
+    card
+}
+
+fn hotkey_setting_row(
+    state: &Jarvis,
+    p: Paint,
+    target: HotkeyTarget,
+    chord: &str,
+    error: &Option<String>,
+) -> El {
+    let recording = state.hotkey_target == Some(target);
+    let description = match target {
+        HotkeyTarget::Dictation => "Start and stop dictation.",
+        HotkeyTarget::Command => "Speak a command to the Assistant.",
+    };
+    let mut column = col().w_full().gap(4.0).child(
+        row()
+            .w_full()
+            .gap(12.0)
+            .center_y()
+            .justify_between()
+            .child(
+                col()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .gap(2.0)
+                    .child(text(target.label()).font(type_::BODY).color(p.t.text))
+                    .child(
+                        text(description)
+                            .font(type_::LABEL)
+                            .color(p.t.text_secondary),
+                    ),
+            )
+            .child(if recording {
+                row()
+                    .gap(8.0)
+                    .center_y()
+                    .child(
+                        text("Press a chord…")
+                            .font(type_::LABEL)
+                            .color(warning_color()),
+                    )
+                    .child(link_button(p, "cancel-hotkey", "Cancel", |state| {
+                        state.cancel_hotkey_capture()
+                    }))
+            } else {
+                row()
+                    .gap(8.0)
+                    .center_y()
+                    .child(hotkey_chip(
+                        p,
+                        &format!("hotkey-{}", target.setting()),
+                        &display_chord(chord),
+                    ))
+                    .child(secondary_button(
+                        p,
+                        &format!("record-hotkey-{}", target.setting()),
+                        "Record",
+                        true,
+                        move |state| state.begin_hotkey_capture(target),
+                    ))
+            }),
+    );
+    if let Some(error) = error {
+        column = column.child(text(error).font(type_::LABEL).color(warning_color()));
+    }
+    column
 }
 
 fn appearance_page(state: &Jarvis, p: Paint) -> El {
@@ -1602,7 +1804,7 @@ fn about_page(state: &Jarvis, p: Paint) -> El {
                 .child(section_heading(p, "About"))
                 .child(info_row(p, "Application", "Jarvis for Windows"))
                 .child(info_row(p, "Version", state.version))
-                .child(info_row(p, "Build", "Phase 4 · commands"))
+                .child(info_row(p, "Build", "Phase 5 · routines & insights"))
                 .child(info_row(p, "Platform", std::env::consts::OS))
                 .child(info_row(
                     p,
@@ -1650,34 +1852,475 @@ fn about_page(state: &Jarvis, p: Paint) -> El {
         )
 }
 
-fn placeholder_page(section: Section, p: Paint) -> El {
-    col()
-        .key(format!("placeholder-{}", section.key()))
+fn routines_page(state: &Jarvis, p: Paint) -> El {
+    let can_add =
+        !state.routine_name.text.trim().is_empty() && !state.routine_command.text.trim().is_empty();
+    let mut page = col()
+        .key("routines-page")
         .w_full()
-        .max_w(720.0)
-        .gap(14.0)
+        .max_w(900.0)
+        .gap(16.0)
         .child(
-            text(section.label())
-                .font(TextStyle::new(24.0, 650.0))
-                .color(p.t.text),
+            text("Save a compound command once and run it whenever you need it.")
+                .font(type_::BODY)
+                .color(p.t.text_secondary),
         )
         .child(
-            card(p, "placeholder-card")
+            card(p, "routine-new")
+                .child(section_heading(p, "New routine"))
                 .child(
-                    text("This screen arrives in a later build. Phase 4 ships the app shell, setup, models, local dictation and Windows commands.")
+                    text("Name it, then give it a command. Steps run in order through the same safety checks as typed commands.")
+                        .font(type_::LABEL)
+                        .color(p.t.text_secondary),
+                )
+                .child(
+                    row()
+                        .w_full()
+                        .gap(10.0)
+                        .child(
+                            row()
+                                .key("routine-name-field")
+                                .w(240.0)
+                                .h(42.0)
+                                .px(10.0)
+                                .radius(radius::MD)
+                                .fill(p.t.control_off)
+                                .border(p.hair, p.t.card_border)
+                                .center_y()
+                                .child(
+                                    text_input(
+                                        &state.routine_name,
+                                        TextStyle::new(14.0, 400.0),
+                                    )
+                                    .single_line()
+                                    .placeholder(
+                                        "Routine name",
+                                        p.t.text_secondary.alpha(0.38),
+                                    )
+                                    .w_full()
+                                    .on_edit(|state: &mut Jarvis| {
+                                        &mut state.routine_name
+                                    }),
+                                ),
+                        )
+                        .child(
+                            row()
+                                .key("routine-command-field")
+                                .grow(1.0)
+                                .min_w(0.0)
+                                .h(42.0)
+                                .px(10.0)
+                                .radius(radius::MD)
+                                .fill(p.t.control_off)
+                                .border(p.hair, p.t.card_border)
+                                .center_y()
+                                .child(
+                                    text_input(
+                                        &state.routine_command,
+                                        TextStyle::new(14.0, 400.0),
+                                    )
+                                    .single_line()
+                                    .placeholder(
+                                        "open chrome and open vscode",
+                                        p.t.text_secondary.alpha(0.38),
+                                    )
+                                    .w_full()
+                                    .on_edit(|state: &mut Jarvis| {
+                                        &mut state.routine_command
+                                    })
+                                    .on_submit(|state: &mut Jarvis, _tx| {
+                                        state.add_routine()
+                                    }),
+                                ),
+                        ),
+                )
+                .child(
+                    row()
+                        .w_full()
+                        .gap(10.0)
+                        .center_y()
+                        .child(primary_button(
+                            p,
+                            "routine-add",
+                            "Add routine",
+                            can_add,
+                            |state| state.add_routine(),
+                        ))
+                        .child(
+                            text(if let Some(error) = &state.routine_error {
+                                error.clone()
+                            } else {
+                                "Runs the whole command, including conjunctions.".into()
+                            })
+                            .font(type_::LABEL)
+                            .color(if state.routine_error.is_some() {
+                                danger_color()
+                            } else {
+                                p.t.text_secondary
+                            }),
+                        ),
+                ),
+        );
+
+    if state.routines.routines.is_empty() {
+        page = page.child(
+            card(p, "routines-list").child(
+                col()
+                    .w_full()
+                    .items_center()
+                    .gap(6.0)
+                    .py(8.0)
+                    .child(
+                        text("No routines yet")
+                            .font(TextStyle::new(15.0, 600.0))
+                            .color(p.t.text),
+                    )
+                    .child(
+                        text("Try “Focus time” with “open chrome and open vscode”.")
+                            .font(type_::BODY)
+                            .color(p.t.text_secondary),
+                    ),
+            ),
+        );
+    } else {
+        let mut rows = col().w_full().gap(10.0);
+        for (index, routine) in state.routines.routines.iter().enumerate() {
+            let steps = planner::split_by_conjunction(&routine.command);
+            let summary = if steps.len() > 1 {
+                steps.join("  →  ")
+            } else {
+                routine.command.clone()
+            };
+            rows = rows.child(
+                row()
+                    .key(format!("routine-{index}"))
+                    .w_full()
+                    .gap(12.0)
+                    .center_y()
+                    .child(
+                        el().size(30.0, 30.0)
+                            .radius(9.0)
+                            .fill(p.accent.alpha(0.12))
+                            .center()
+                            .child(el().size(8.0, 8.0).radius(4.0).fill(p.accent)),
+                    )
+                    .child(
+                        col()
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .gap(2.0)
+                            .child(
+                                text(routine.name.clone())
+                                    .font(TextStyle::new(15.0, 550.0))
+                                    .color(p.t.text),
+                            )
+                            .child(
+                                text(summary)
+                                    .font(type_::LABEL)
+                                    .color(p.t.text_secondary)
+                                    .truncate_middle(),
+                            ),
+                    )
+                    .child(
+                        row()
+                            .gap(6.0)
+                            .child(secondary_button(
+                                p,
+                                &format!("routine-run-{index}"),
+                                "Run",
+                                true,
+                                move |state| state.run_routine(index),
+                            ))
+                            .child(link_button(
+                                p,
+                                &format!("routine-delete-{index}"),
+                                "Delete",
+                                move |state| state.delete_routine(index),
+                            )),
+                    ),
+            );
+        }
+        page = page.child(
+            card(p, "routines-list")
+                .child(section_heading(p, "Saved routines"))
+                .child(rows),
+        );
+    }
+
+    page.child(
+        text(format!(
+            "Routines are stored locally in {} and run through the command pipeline.",
+            state.paths.relative_to_data(&state.paths.routines_file)
+        ))
+        .font(type_::LABEL)
+        .color(p.t.text_secondary),
+    )
+}
+
+fn insights_page(state: &Jarvis, p: Paint) -> El {
+    let insights = &state.insights;
+    let rate = insights
+        .success_rate()
+        .map_or_else(|| "—".to_string(), |rate| format!("{rate}%"));
+    let model = insights.intent + insights.ollama;
+    let days = insights.last_days(7);
+    let max_commands = days.iter().map(|day| day.commands).max().unwrap_or(0);
+
+    let chart = if insights.total == 0 {
+        col()
+            .w_full()
+            .items_center()
+            .gap(5.0)
+            .py(20.0)
+            .child(
+                text("No commands yet")
+                    .font(TextStyle::new(15.0, 600.0))
+                    .color(p.t.text),
+            )
+            .child(
+                text(format!(
+                    "Try “open notepad” or press {}.",
+                    display_chord(&state.settings.command_hotkey)
+                ))
+                .font(type_::BODY)
+                .color(p.t.text_secondary),
+            )
+    } else {
+        let mut bars = row().key("insights-chart-bars").w_full().gap(10.0);
+        for (index, day) in days.iter().enumerate() {
+            let height = if day.commands == 0 {
+                4.0
+            } else {
+                12.0 + (day.commands as f32 / max_commands.max(1) as f32) * 96.0
+            };
+            let active = index + 1 == days.len();
+            bars = bars.child(
+                col()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .items_center()
+                    .gap(6.0)
+                    .child(
+                        col().h(112.0).justify_end().child(
+                            el().size(28.0, height)
+                                .radius(4.0)
+                                .fill(p.accent.alpha(if active { 1.0 } else { 0.6 })),
+                        ),
+                    )
+                    .child(
+                        text(weekday_short(&day.day))
+                            .font(type_::LABEL)
+                            .color(p.t.text_secondary),
+                    )
+                    .child(
+                        text(day.commands.to_string())
+                            .font(type_::MONO_CAPTION)
+                            .color(p.t.text),
+                    ),
+            );
+        }
+        bars
+    };
+
+    let total = insights.branch_total();
+    let mut branches = col().w_full().gap(8.0);
+    for (label, count, color) in [
+        ("Rules", insights.rules, p.accent),
+        ("Intent model", insights.intent, p.t.text),
+        ("Ollama", insights.ollama, p.t.text_secondary),
+        ("Local", insights.local, p.t.text_secondary),
+    ] {
+        let width = if total == 0 {
+            0.0
+        } else {
+            (count as f32 / total as f32) * 200.0
+        };
+        branches = branches.child(
+            row()
+                .w_full()
+                .key(format!(
+                    "insights-branch-{}",
+                    label.to_lowercase().replace(' ', "-")
+                ))
+                .gap(10.0)
+                .center_y()
+                .child(
+                    text(label)
+                        .w(88.0)
                         .font(type_::BODY)
                         .color(p.t.text_secondary),
                 )
                 .child(
-                    row().pt(4.0).child(secondary_button(
-                        p,
-                        "placeholder-open-setup",
-                        "Open setup",
-                        true,
-                        |state| state.open_settings(SettingsPage::Setup),
-                    )),
+                    row()
+                        .w(200.0)
+                        .h(6.0)
+                        .radius(3.0)
+                        .fill(p.t.control_track)
+                        .child(
+                            el().w(width.max(if count > 0 { 2.0 } else { 0.0 }))
+                                .h(6.0)
+                                .radius(3.0)
+                                .fill(color),
+                        ),
+                )
+                .child(
+                    text(count.to_string())
+                        .font(type_::MONO_CAPTION)
+                        .color(p.t.text_secondary),
+                ),
+        );
+    }
+
+    col()
+        .key("insights-page")
+        .w_full()
+        .max_w(940.0)
+        .gap(16.0)
+        .child(
+            text("A local view of commands, successes and which branch handled them.")
+                .font(type_::BODY)
+                .color(p.t.text_secondary),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(10.0)
+                .child(stat_tile(
+                    p,
+                    "insights-stat-commands",
+                    "Commands",
+                    insights.total.to_string(),
+                    "all time",
+                    p.t.text,
+                ))
+                .child(stat_tile(
+                    p,
+                    "insights-stat-success",
+                    "Success",
+                    rate,
+                    "completed",
+                    success_color(),
+                )),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(10.0)
+                .child(stat_tile(
+                    p,
+                    "insights-stat-rules",
+                    "Rules",
+                    insights.rules.to_string(),
+                    "deterministic",
+                    p.accent,
+                ))
+                .child(stat_tile(
+                    p,
+                    "insights-stat-model",
+                    "Model",
+                    model.to_string(),
+                    "intent + Ollama",
+                    p.t.text,
+                )),
+        )
+        .child(
+            card(p, "insights-chart")
+                .child(
+                    row()
+                        .w_full()
+                        .justify_between()
+                        .center_y()
+                        .child(section_heading(p, "Commands per day"))
+                        .child(
+                            text("Last 7 days")
+                                .font(type_::LABEL)
+                                .color(p.t.text_secondary),
+                        ),
+                )
+                .child(chart),
+        )
+        .child(
+            card(p, "insights-branches")
+                .child(section_heading(p, "Branches"))
+                .child(branches),
+        )
+        .child(
+            card(p, "insights-note")
+                .child(section_heading(p, "Local by default"))
+                .child(
+                    text("Usage is written to insights.json on this PC. No command text, audio or model request leaves the machine.")
+                        .w_full()
+                        .font(type_::BODY)
+                        .color(p.t.text_secondary),
+                )
+                .child(
+                    text(format!(
+                        "{} succeeded · {} failed",
+                        insights.succeeded, insights.failed
+                    ))
+                    .font(type_::MONO_CAPTION)
+                    .color(p.t.text_secondary),
                 ),
         )
+        .child(
+            text("Insights are recorded when a command finishes; failed plans count too.")
+                .font(type_::LABEL)
+                .color(p.t.text_secondary),
+        )
+}
+
+fn stat_tile(p: Paint, key: &str, label: &str, value: String, sub: &str, color: Color) -> El {
+    col()
+        .key(key)
+        .grow(1.0)
+        .min_w(0.0)
+        .w_full()
+        .padding(14.0)
+        .gap(4.0)
+        .fill(p.t.card)
+        .radius(radius::MD)
+        .border(p.hair, p.t.card_border)
+        .child(
+            text(label.to_uppercase())
+                .font(type_::SECTION)
+                .color(p.t.text_secondary),
+        )
+        .child(text(value).font(TextStyle::new(26.0, 650.0)).color(color))
+        .child(text(sub).font(type_::LABEL).color(p.t.text_secondary))
+}
+
+fn toggle_switch(
+    p: Paint,
+    key: &str,
+    on: bool,
+    enabled: bool,
+    on_press: impl Fn(&mut Jarvis) + 'static,
+) -> El {
+    let mut track = el()
+        .key(key.to_string())
+        .w(38.0)
+        .h(22.0)
+        .radius(11.0)
+        .fill(if on { p.accent } else { p.t.control_off })
+        .role("switch")
+        .checked(on)
+        .label(if on { "On" } else { "Off" });
+    if enabled {
+        track = track.focusable(true).on_press(on_press);
+    }
+    let mut inner = row().w_full().h_full().px(2.0).center_y();
+    inner = if on {
+        inner.justify_end()
+    } else {
+        inner.justify_start()
+    };
+    track.child(
+        inner.child(el().size(18.0, 18.0).radius(9.0).fill(if enabled {
+            Color::WHITE
+        } else {
+            p.t.text_secondary
+        })),
+    )
 }
 
 fn card(p: Paint, key: &str) -> El {
@@ -1940,6 +2583,66 @@ mod tests {
         assert!(runtime.find("assistant-result-message").is_some());
         assert!(runtime.find("assistant-file-open-0").is_some());
         assert!(runtime.find("assistant-file-reveal-0").is_some());
+    }
+
+    #[test]
+    fn routines_page_shows_saved_steps() {
+        let mut state = Jarvis::for_test();
+        state.section = Section::Routines;
+        state.setup = Jarvis::demo_report(true);
+        state
+            .routines
+            .add("Focus time", "open chrome and open vscode")
+            .unwrap();
+        let mut runtime = Runtime::new(state, view, (1120.0, 760.0), Env::new(true, 1.0));
+        runtime.frame(0.0);
+
+        assert!(runtime.find("routines-page").is_some());
+        assert!(runtime.find("routine-new").is_some());
+        assert!(runtime.find("routine-name-field").is_some());
+        assert!(runtime.find("routine-command-field").is_some());
+        assert!(runtime.find("routine-add").is_some());
+        assert!(runtime.find("routine-0").is_some());
+        assert!(runtime.find("routine-run-0").is_some());
+        assert!(runtime.find("routine-delete-0").is_some());
+    }
+
+    #[test]
+    fn insights_page_shows_stats_chart_and_branches() {
+        let mut state = Jarvis::for_test();
+        state.section = Section::Insights;
+        state.setup = Jarvis::demo_report(true);
+        state.insights.record("Rules", true);
+        state.insights.record("Intent model", false);
+        let mut runtime = Runtime::new(state, view, (1120.0, 760.0), Env::new(true, 1.0));
+        runtime.frame(0.0);
+
+        assert!(runtime.find("insights-page").is_some());
+        assert!(runtime.find("insights-stat-commands").is_some());
+        assert!(runtime.find("insights-stat-success").is_some());
+        assert!(runtime.find("insights-chart").is_some());
+        assert!(runtime.find("insights-chart-bars").is_some());
+        assert!(runtime.find("insights-branch-rules").is_some());
+        assert!(runtime.find("insights-branch-intent-model").is_some());
+    }
+
+    #[test]
+    fn general_settings_shows_hotkeys_and_startup() {
+        let mut state = Jarvis::for_test();
+        state.section = Section::Settings;
+        state.settings_page = SettingsPage::General;
+        state.setup = Jarvis::demo_report(true);
+        let mut runtime = Runtime::new(state, view, (1120.0, 760.0), Env::new(true, 1.0));
+        runtime.frame(0.0);
+
+        assert!(runtime.find("hotkeys-card").is_some());
+        assert!(runtime.find("hotkey-dictation").is_some());
+        assert!(runtime.find("hotkey-command").is_some());
+        assert!(runtime.find("record-hotkey-dictation").is_some());
+        assert!(runtime.find("record-hotkey-command").is_some());
+        assert!(runtime.find("startup-card").is_some());
+        assert!(runtime.find("toggle-launch-at-login").is_some());
+        assert!(runtime.find("toggle-close-to-tray").is_some());
     }
 
     #[test]

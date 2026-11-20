@@ -8,7 +8,7 @@ The macOS project is cloned into `jarvuss/` for reference and is ignored by git.
 
 ## Status
 
-**Phase 4 complete: local command routing and Windows actions.**
+**Phase 5 complete: routines, insights, tray, startup and configurable hotkeys.**
 
 - Rune (native GPU-rendered Rust UI) application window with navigation.
 - First-run setup with essentials progress, status chips and per-item fixes.
@@ -26,11 +26,11 @@ The macOS project is cloned into `jarvuss/` for reference and is ignored by git.
   and overlap dedupe/stitch before the final transcript.
 - Persistent Whisper worker: lazy load, English greedy decoding, and idle unload
   after 300 s.
-- Global `Ctrl+Shift+D` dictation hotkey, Voice page Start/Stop/Cancel controls,
-  and transcript Copy.
+- Default `Ctrl+Shift+D` dictation hotkey (configurable), Voice page
+  Start/Stop/Cancel controls, and transcript Copy.
 - Automatic paste at the cursor with clipboard snapshot/restore; elevated windows
   that block synthetic input fall back to leaving the transcript on the clipboard.
-- Assistant command bar and global `Ctrl+Shift+A` command dictation.
+- Assistant command bar and default `Ctrl+Shift+A` command dictation.
 - Deterministic command planner ported from the macOS rust-core, with Windows app,
   settings, folder, file and safety policy.
 - Local learned intent engine for unknown non-questions: DirectML first, CPU
@@ -40,7 +40,15 @@ The macOS project is cloned into `jarvuss/` for reference and is ignored by git.
   folders, file creation/search/open/reveal, time/date/battery/WiFi/volume.
 - Pre-execution safety: destructive/elevated commands blocked, installs previewed,
   protected system paths denied, app-close allowlist and http(s)-only links.
-- Persisted settings (theme, accent, setup completion) with atomic writes.
+- Routines: named compound commands stored locally, shown as ordered steps, and
+  run through the same planner and safety checks.
+- Insights: command totals, success rate, branch split and a seven-day chart,
+  recorded locally when a command finishes.
+- Windows tray menu (Open, Dictate, Command, Settings, Quit) with close-to-tray.
+- Launch at login through the user's Run key, and configurable dictation/command
+  hotkeys recorded from a chord.
+- Persisted settings (theme, accent, setup, hotkeys, startup, tray) with atomic
+  writes.
 - Timestamped command log under the data directory.
 - Cross-platform dev preview: the same app runs on macOS for UI work.
 - GitHub Actions on Windows and macOS: formatting, clippy, tests, build.
@@ -55,11 +63,15 @@ The macOS project is cloned into `jarvuss/` for reference and is ignored by git.
 
 ![Assistant](docs/screenshots/assistant.png)
 
+![Routines](docs/screenshots/routines.png)
+
+![Insights](docs/screenshots/insights.png)
+
 ![Appearance](docs/screenshots/appearance.png)
 
-The screenshots use demo statuses, a demo transcript and a demo command result;
-the real app fills them from the Windows probes, microphone, command planner and
-model workers.
+The screenshots use demo statuses, a demo transcript, demo routines and demo
+insights; the real app fills them from the Windows probes, microphone, command
+planner and model workers.
 
 ## Stack
 
@@ -70,6 +82,8 @@ model workers.
 | Dictation | cpal/WASAPI, 16 kHz mono, VAD, 6 s chunks with 1 s overlap |
 | Commands | Ported deterministic planner + t5 intent + optional Ollama |
 | Windows actions | `ShellExecute`, WASAPI volume, media keys, `ms-settings`, file search |
+| Routines and insights | local JSON stores, planner replay, local aggregation |
+| Tray and startup | Rune `Shell_NotifyIcon` tray, `HKCU\...\Run` |
 | Hotkeys and paste | Win32 `RegisterHotKey` + clipboard/`SendInput` |
 | Intent | fine-tuned t5-small, int8 ONNX from [Hugging Face](https://huggingface.co/chitesh12545/jarvis-intent-t5-small) |
 | Speech acceleration | Vulkan feature build (NVIDIA, AMD, Intel iGPUs), CPU fallback |
@@ -129,6 +143,9 @@ cargo run -p jarvis-app -- --snap setup.png --scene setup
 cargo run -p jarvis-app -- --snap downloading.png --scene downloading
 cargo run -p jarvis-app -- --snap voice.png --scene voice
 cargo run -p jarvis-app -- --snap ready.png --scene ready
+cargo run -p jarvis-app -- --snap routines.png --scene routines
+cargo run -p jarvis-app -- --snap insights.png --scene insights
+cargo run -p jarvis-app -- --snap settings.png --scene settings
 cargo run -p jarvis-app -- --snap appearance.png --scene appearance
 ```
 
@@ -138,7 +155,9 @@ On Windows everything lives under `%LOCALAPPDATA%\Jarvis`:
 
 ```text
 %LOCALAPPDATA%\Jarvis\
-  settings.json                     theme, accent, setup completion
+  settings.json                     theme, accent, hotkeys, startup, setup
+  routines.json                     saved named commands
+  insights.json                     local command totals and daily buckets
   logs\commands.log                 timestamped app and setup log
   models\
     ggml-large-v3-turbo.bin         speech model (about 1.5 GB)
@@ -180,8 +199,9 @@ Download behaviour:
 
 ## Dictation
 
-Press `Ctrl+Shift+D` anywhere, speak, then press it again. You can also use the
-Voice page's Start/Stop buttons. The window does not need focus.
+Press `Ctrl+Shift+D` (the default) anywhere, speak, then press it again. You can
+also use the Voice page's Start/Stop buttons, and change the chord in Settings →
+General. The window does not need focus.
 
 - The microphone opens at its native format; channels are averaged and a stateful
   resampler produces 16 kHz mono.
@@ -198,15 +218,15 @@ Voice page's Start/Stop buttons. The window does not need focus.
 - The recording cap is 300 s; reaching it stops capture and transcribes what was
   recorded.
 
-Limitations in this phase: the hotkey is fixed; clipboard restore preserves text
-only; there is no floating dictation pill or tray overlay yet (Phase 5).
+Limitations: clipboard restore preserves text only; there is no floating
+dictation pill yet. Hotkeys are configurable in Settings → General.
 
 ## Commands
 
-Type a command in the Assistant bar or press `Ctrl+Shift+A`, speak, and press it
-again. The command hotkey needs the speech model; typed commands work without it.
-No window focus is required, so commands can be spoken while another app is
-active.
+Type a command in the Assistant bar or press `Ctrl+Shift+A` (the default), speak,
+and press it again. The command hotkey needs the speech model; typed commands work
+without it. No window focus is required, so commands can be spoken while another
+app is active. Both global hotkeys are configurable in Settings → General.
 
 Routing is deliberately local-first:
 
@@ -254,6 +274,39 @@ it is running, the planner uses `qwen2.5:1.5b-instruct` with a 20 s planning
 timeout and a 30 s answer timeout. Without Ollama, unknown free-form questions
 return a clear local-only message instead of silence.
 
+## Routines
+
+The Routines page saves a name plus a compound command in `routines.json`. Steps
+split on the same conjunctions as speech commands and are shown in order. Run
+sends the command through the normal planner, safety checks and result card. You
+can also type or speak the routine's name (or `run <name>`). Delete removes it
+immediately. Routines are local and never uploaded.
+
+## Insights
+
+Insights records one event when a command finishes, including failed plans:
+total, succeeded/failed, the deciding branch (Rules, Intent model, Ollama or
+Local), and a daily bucket. The page shows totals, success rate, a seven-day
+chart and the branch split. History is capped at 90 days in `insights.json`; no
+command text, audio or model request is stored or sent anywhere.
+
+## Tray, startup and hotkeys
+
+On Windows the app keeps a tray icon with Open Jarvis, Dictate, Command, Settings
+and Quit. Closing the window leaves Jarvis running in the tray by default; turn
+that off in Settings → General to make close quit. The tray reopens the window
+with its state intact.
+
+Launch at login writes the current executable to
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. It launches the window
+normally; there is no silent-background launch yet.
+
+Settings → General has Record buttons for both global hotkeys. Choose a modifier
+(Ctrl, Shift, Alt or Win) plus a letter, digit, F1–F24 or Space; Escape cancels.
+The new chord is registered before it is saved, the other hotkey cannot collide,
+and a failed registration leaves the old one working. Defaults are
+`Ctrl+Shift+D` for dictation and `Ctrl+Shift+A` for commands.
+
 ## Phases
 
 | Phase | Scope | Status |
@@ -262,8 +315,8 @@ return a clear local-only message instead of silence.
 | 2 | Model manager: download, resume, verify, activate, warm up, GPU providers | Done |
 | 3 | Audio capture, VAD, Whisper transcription, dictation hotkey, text insertion | Done |
 | 4 | Command planner/actions, Windows app/URL/volume/media/files/settings | Done |
-| 5 | Routines, insights, tray, startup, hotkey settings, UI parity | Next |
-| 6 | Packaging (MSIX/NSIS), release artifacts, performance hardening | Planned |
+| 5 | Routines, insights, tray, startup, hotkey settings, UI parity | Done |
+| 6 | Packaging (MSIX/NSIS), release artifacts, performance hardening | Next |
 
 Architecture and porting notes: [ARCHITECTURE.md](ARCHITECTURE.md).
 

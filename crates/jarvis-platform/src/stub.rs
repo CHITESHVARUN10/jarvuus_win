@@ -54,6 +54,7 @@ impl HotkeyRegistration {
 pub fn start_dictation_hotkey(
     _sender: Sender<HotkeyEvent>,
     _waker: crate::Wake,
+    _hotkey: jarvis_core::hotkey::Hotkey,
 ) -> Result<HotkeyRegistration, String> {
     Err("Global dictation hotkeys are Windows-only in this preview.".into())
 }
@@ -61,8 +62,13 @@ pub fn start_dictation_hotkey(
 pub fn start_command_hotkey(
     _sender: Sender<HotkeyEvent>,
     _waker: crate::Wake,
+    _hotkey: jarvis_core::hotkey::Hotkey,
 ) -> Result<HotkeyRegistration, String> {
     Err("Global command hotkeys are Windows-only in this preview.".into())
+}
+
+pub fn set_launch_at_login(_enabled: bool) -> Result<(), String> {
+    Err("Launch at login is Windows-only in this preview.".into())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
