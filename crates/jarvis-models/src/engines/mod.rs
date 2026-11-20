@@ -13,7 +13,7 @@ mod intent;
 #[cfg(feature = "inference")]
 mod runtime;
 #[cfg(feature = "inference")]
-mod whisper;
+pub mod whisper;
 
 pub fn warm_speech(paths: &AppPaths) -> Result<Warmup> {
     #[cfg(feature = "inference")]

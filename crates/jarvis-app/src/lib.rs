@@ -4,6 +4,7 @@ mod ui;
 pub use app::{Jarvis, Notice, NoticeTone, Section, SettingsPage};
 
 use jarvis_models::manager::{ModelKind, ModelPhase, ModelUpdate};
+use jarvis_speech::DictationState;
 use rune::AppSpec;
 
 type Scene = (&'static str, fn(&mut Jarvis));
@@ -47,6 +48,34 @@ const SCENES: &[Scene] = &[
         state.section = Section::Assistant;
         state.setup = Jarvis::demo_report(true);
         state.setup_running = false;
+        state.models.speech = ModelUpdate::new(
+            ModelKind::Speech,
+            ModelPhase::Ready,
+            "Whisper loaded on vulkan and passed a silent warm-up.",
+        )
+        .with_fraction(1.0)
+        .with_backend("vulkan");
+        state.models.intent = ModelUpdate::new(
+            ModelKind::Intent,
+            ModelPhase::Ready,
+            "Intent model v1.0.2 loaded on directml and passed its warm-up.",
+        )
+        .with_fraction(1.0)
+        .with_backend("directml")
+        .with_version("1.0.2");
+    }),
+    ("voice", |state| {
+        state.section = Section::Voice;
+        state.setup = Jarvis::demo_report(true);
+        state.speech.state = DictationState::Listening;
+        state.speech.detail = "Listening...".into();
+        state.speech.level = 0.62;
+        state.speech.partial = "remind me to send the design review before the standup".into();
+        state.speech.device = Some("Microphone Array (Realtek Audio)".into());
+        state.speech.model_loaded = true;
+        state.speech.backend = Some("vulkan".into());
+        state.speech.model_detail = "Whisper loaded on vulkan.".into();
+        state.speech.hotkey_error = None;
         state.models.speech = ModelUpdate::new(
             ModelKind::Speech,
             ModelPhase::Ready,

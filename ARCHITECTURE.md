@@ -10,7 +10,8 @@ the starting point.
 ```text
 crates/jarvis-app
   ├── crates/jarvis-core        OS-neutral paths, settings, setup model, logging
-  ├── crates/jarvis-platform    Windows probes and shell integration
+  ├── crates/jarvis-platform    Windows probes, hotkey, clipboard insertion
+  ├── crates/jarvis-speech      capture, VAD, chunking, dictation controller
   └── crates/jarvis-models      downloads, verified releases, warm-up engines
               └── jarvis-core
 ```
@@ -23,6 +24,9 @@ crates/jarvis-app
 - **jarvis-models** owns model storage, ranged downloads, Hugging Face release
   resolution, checksum verification, atomic activation, the whisper-rs and ONNX
   engines, and the thread-based `ModelManager`. It depends only on core.
+- **jarvis-speech** owns the cpal capture thread, resampling, VAD, chunking, the
+  persistent Whisper worker, session epochs and the dictation lifecycle. It
+  depends on core and the model crate's `WhisperEngine`.
 - **jarvis-app** owns the Rune view, navigation, first-run gating, the setup probe
   and the model manager channel. The binary is a thin `main` that claims a
   single-instance name and runs the app.
@@ -43,12 +47,14 @@ main
             ├─ first run? Settings → Setup : Assistant
             └─ write launch line to logs/commands.log
        └─ first frame (setup rows show "Checking")
-       ├─ model manager channel + initial on-disk model states
+       ├─ model manager, speech, hotkey and insertion channels
        └─ AppSpec::setup
-            ├─ store the Rune waker and model notifier
+            ├─ store the Rune waker; attach model and dictation notifiers
+            ├─ register Ctrl+Shift+D (Windows)
             └─ spawn probe thread → SetupReport → wake
        └─ AppSpec::poll
             ├─ drain ModelUpdate events → setup rows, essentials, progress
+            ├─ drain SpeechEvent, HotkeyEvent and insertion results
             └─ drain SetupReport → baseline setup status
 ```
 
@@ -92,12 +98,13 @@ Windows has no Accessibility or Automation grant equivalent to macOS.
   registry probe reads the device-wide and `NonPackaged` values and treats
   missing values as allowed. There is no request dialog to show; the setup row
   deep-links to `ms-settings:privacy-microphone` when access is off.
-- **Text insertion.** Later phases use `SendInput` for Ctrl+V. It needs no grant.
-  A non-elevated process cannot inject into an elevated foreground window (UIPI);
-  the insertion path will detect that and fall back to placing the transcript on
-  the clipboard with a notice.
-- **Global hotkeys.** `RegisterHotKey` needs no permission. Planned defaults are
-  `Ctrl+Shift+D` (dictate) and `Ctrl+Shift+A` (command).
+- **Text insertion.** `SendInput` sends Ctrl+V; it needs no grant. A non-elevated
+  process cannot inject into an elevated foreground window (UIPI). `SendInput`
+  returning zero leaves the transcript on the clipboard and reports
+  `ClipboardOnly` instead of pretending the paste worked.
+- **Global hotkeys.** `RegisterHotKey` needs no permission. `Ctrl+Shift+D`
+  (dictate) is registered on a dedicated message-loop thread with
+  `MOD_NOREPEAT`; `Ctrl+Shift+A` (command) arrives with Phase 4.
 - **Launch at login.** Planned `HKCU\...\Run` or MSIX startup task; the system
   remains the source of truth and is re-read after toggling.
 
@@ -192,31 +199,51 @@ SDK (`glslc`) at build time. A GPU build first loads with `use_gpu = true` and
 retries with the CPU context if initialization fails; the backend actually used
 is reported in the UI.
 
-## Speech plan (Phase 3)
+## Speech pipeline (implemented)
 
-Reuse the macOS `stt-core` design, replacing AVFoundation with cpal's WASAPI
-host:
+**Capture.** `jarvis-speech::audio` spawns a dedicated thread that owns cpal's
+`!Send` stream. The stream opens at the device's native sample rate and channel
+count; frames are averaged to mono and passed through a stateful linear
+resampler to the 16 kHz contract. The capture buffer is bounded at 300 s and
+keeps the beginning rather than rolling, because chunk offsets depend on it.
+Level RMS is published at most every 50 ms. A watchdog reports a dead stream if
+no buffers arrive for 3 s.
 
-- 16 kHz mono contract; device-native formats are downmixed and resampled with
-  the stateful linear resampler.
-- Bounded capture buffer that keeps the beginning rather than rolling (chunk
-  offsets depend on it).
-- 20 ms RMS frames with a 0.004 floor; a speech window needs at least 120 ms of
-  voiced frames. This is what prevents Whisper hallucinating on clicks.
-- 6 s chunks with 1 s overlap; text dedupe by suffix/prefix matching, then
-  stitching.
-- Greedy decoding, language `en`, `no_context`, `single_segment`, blank and
-  non-speech suppression.
-- A session epoch invalidates in-flight results after cancel; Whisper contexts
-  live on one dedicated worker thread.
-- Idle unload after 300 s; microphone stop never unloads.
+**Gate and chunks.** Silence is measured over 20 ms frames with an RMS floor of
+0.004. A speech window needs at least six voiced frames (120 ms) and keeps 160 ms
+of padding, so a click or breath never reaches Whisper. While recording, a
+chunker snapshots the last 7 s every 6 s (1 s overlap) and sends only windows
+that pass the gate. On stop, the final slice starts 1 s before the last sent
+window; if a chunk failed or none were sent, it starts at zero. The worker
+dedupes overlapping words and stitches the session transcript. A silent final
+tail finalizes the partial text instead of discarding it.
 
-Dictation will use `Ctrl+Shift+D`, command capture `Ctrl+Shift+A`. Text insertion
-is clipboard save → Ctrl+V → delayed restore, with a clipboard-only fallback
-when the target is elevated.
+**Worker.** One long-lived thread owns `WhisperEngine`, loaded lazily on the
+first session. Each chunk gets a fresh decode state with English, greedy
+sampling, `no_context`, `single_segment`, blank/non-speech suppression and four
+threads. The worker only accepts commands for the current session id, so cancel,
+restart and stale queued chunks cannot publish a late result. It unloads the
+model after 300 s with no session activity.
+
+**Lifecycle.** `DictationController` allows one active capture. `start` checks
+the cheap on-disk model state, starts the stream, then sends `StartSession`.
+`stop` joins the chunker, drops the stream, and sends the final buffered audio.
+`cancel` advances the session, stops capture/chunker and sends `Cancel` without
+emitting a final. Every app event carries the session id; the app drops stale
+events. `abort` is the error path: it tears down capture without overwriting the
+error state with an idle event.
+
+**Hotkey and insertion.** A dedicated Windows thread registers
+`Ctrl+Shift+D` with `MOD_NOREPEAT`, pumps `WM_HOTKEY`, and wakes Rune through the
+app's waker. Registration failure is surfaced with a retry. Automatic insertion
+snapshots the text clipboard, writes the transcript, sends Ctrl+V with
+`SendInput`, and restores the snapshot only if the clipboard still holds the
+transcript. If `SendInput` returns zero (elevated target/UIPI), the transcript is
+left on the clipboard and the UI says so. The clipboard snapshot is text-only.
 
 The macOS Apple `SpeechAnalyzer` path and Porcupine wake word are not part of the
-Windows plan. Live listening is Whisper-only.
+Windows plan. Live listening is Whisper-only. A floating dictation pill, tray
+state and configurable hotkeys arrive with Phase 5.
 
 ## Command plan (Phase 4)
 
@@ -245,8 +272,13 @@ silence.
 2. Rust 1.97.1 with rustfmt and clippy.
 3. `cargo fmt --all -- --check`
 4. `cargo clippy --workspace --all-targets -- -D warnings`
-5. `cargo test --workspace --all-targets`
-6. `cargo build --workspace`
+5. `cargo build --workspace`
+6. On Windows, copy `DirectML.dll` beside the test binaries.
+7. `cargo test --workspace --all-targets`
+
+Hardware tests (microphone capture, live model downloads) are `#[ignore]` and
+run on a developer machine, not CI. CI has no microphone and never downloads the
+1.6 GB model.
 
 The headless Rune tests exercise the real view, click targets and state
 transitions, so the setup flow is covered without a display.

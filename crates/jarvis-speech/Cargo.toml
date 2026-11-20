@@ -1,0 +1,16 @@
+[package]
+name = "jarvis-speech"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native audio capture, VAD, chunking and dictation lifecycle for Jarvis"
+
+[dependencies]
+jarvis-core = { path = "../jarvis-core" }
+jarvis-models = { path = "../jarvis-models" }
+cpal = "0.15"
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

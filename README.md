@@ -8,7 +8,7 @@ The macOS project is cloned into `jarvuss/` for reference and is ignored by git.
 
 ## Status
 
-**Phase 2 complete: verified model management and runtime warm-up.**
+**Phase 3 complete: local dictation.**
 
 - Rune (native GPU-rendered Rust UI) application window with navigation.
 - First-run setup with essentials progress, status chips and per-item fixes.
@@ -20,7 +20,16 @@ The macOS project is cloned into `jarvuss/` for reference and is ignored by git.
   immutable version directories with `current.json` / `last-good.json`.
 - Warm-up loading for both models: Whisper on a dedicated worker, DirectML-first
   ONNX Runtime on Windows, and CPU fallback for both.
-- Download progress, speed/ETA, cancel/resume and Load/Retry controls in Setup.
+- Native audio capture at the device format, downmixed and resampled to 16 kHz
+  mono, with a live level meter and a 300 s recording cap.
+- Voice-activity gating, 6 s chunks with 1 s overlap, live partial transcripts,
+  and overlap dedupe/stitch before the final transcript.
+- Persistent Whisper worker: lazy load, English greedy decoding, and idle unload
+  after 300 s.
+- Global `Ctrl+Shift+D` dictation hotkey, Voice page Start/Stop/Cancel controls,
+  and transcript Copy.
+- Automatic paste at the cursor with clipboard snapshot/restore; elevated windows
+  that block synthetic input fall back to leaving the transcript on the clipboard.
 - Optional Ollama probe with a short localhost timeout.
 - Persisted settings (theme, accent, setup completion) with atomic writes.
 - Timestamped command log under the data directory.
@@ -33,12 +42,14 @@ The macOS project is cloned into `jarvuss/` for reference and is ignored by git.
 
 ![Speech model download](docs/screenshots/models.png)
 
+![Voice dictation](docs/screenshots/voice.png)
+
 ![Assistant](docs/screenshots/assistant.png)
 
 ![Appearance](docs/screenshots/appearance.png)
 
-The setup screenshots use demo statuses so every state is visible; the real app
-fills them from the Windows probes and model downloads.
+The screenshots use demo statuses and a demo transcript; the real app fills them
+from the Windows probes, microphone and model worker.
 
 ## Stack
 
@@ -46,6 +57,8 @@ fills them from the Windows probes and model downloads.
 | --- | --- |
 | Interface | [Rune](https://github.com/anomalyco/rune), pinned by revision |
 | Speech to text | whisper.cpp via `whisper-rs`, `ggml-large-v3-turbo` |
+| Dictation | cpal/WASAPI, 16 kHz mono, VAD, 6 s chunks with 1 s overlap |
+| Hotkey and paste | Win32 `RegisterHotKey` + clipboard/`SendInput` |
 | Intent | fine-tuned t5-small, int8 ONNX from [Hugging Face](https://huggingface.co/chitesh12545/jarvis-intent-t5-small) |
 | Speech acceleration | Vulkan feature build (NVIDIA, AMD, Intel iGPUs), CPU fallback |
 | Intent acceleration | DirectML by default on Windows, CPU fallback |
@@ -83,7 +96,7 @@ report that they are Windows-only, and the app uses `JarvisWindows` as its data
 directory so it never touches a real macOS Jarvis install. Real intent warm-up on
 macOS needs an ONNX Runtime dylib via `JARVIS_ORT_DYLIB`.
 
-Live model checks download the real releases and are not part of CI:
+Live checks download real models or use the microphone and are not part of CI:
 
 ```powershell
 # Intent (206 MB). On macOS set JARVIS_ORT_DYLIB to an ONNX Runtime 1.31 dylib.
@@ -91,6 +104,9 @@ cargo test -p jarvis-models --test live_intent -- --ignored --nocapture
 
 # Speech (1.6 GB).
 cargo test -p jarvis-models --test live_speech -- --ignored --nocapture
+
+# Microphone capture only (no model needed).
+cargo test -p jarvis-speech microphone_capture_smoke -- --ignored --nocapture
 ```
 
 Headless renders for UI review (debug builds include Rune's tooling):
@@ -98,6 +114,7 @@ Headless renders for UI review (debug builds include Rune's tooling):
 ```powershell
 cargo run -p jarvis-app -- --snap setup.png --scene setup
 cargo run -p jarvis-app -- --snap downloading.png --scene downloading
+cargo run -p jarvis-app -- --snap voice.png --scene voice
 cargo run -p jarvis-app -- --snap ready.png --scene ready
 cargo run -p jarvis-app -- --snap appearance.png --scene appearance
 ```
@@ -148,14 +165,37 @@ Download behaviour:
 - DirectML is attempted first on Windows for intent; Vulkan is attempted first
   for speech when the `gpu-vulkan` feature is compiled in. Both fall back to CPU.
 
+## Dictation
+
+Press `Ctrl+Shift+D` anywhere, speak, then press it again. You can also use the
+Voice page's Start/Stop buttons. The window does not need focus.
+
+- The microphone opens at its native format; channels are averaged and a stateful
+  resampler produces 16 kHz mono.
+- 20 ms RMS frames gate silence. A chunk must contain at least six voiced frames
+  (120 ms) before it reaches Whisper.
+- Audio is transcribed in 6 s chunks with a 1 s overlap while you speak. The
+  stitched transcript is deduplicated before it becomes final.
+- A fresh Whisper decode is used per chunk. The model loads on first use and is
+  unloaded after 300 s of inactivity.
+- The final transcript is pasted into the foreground window with `Ctrl+V`. The
+  previous text clipboard is restored after the paste if it was not replaced.
+- Windows blocks synthetic input into elevated apps (UIPI). In that case Jarvis
+  leaves the transcript on the clipboard and says so in the UI.
+- The recording cap is 300 s; reaching it stops capture and transcribes what was
+  recorded.
+
+Limitations in this phase: the hotkey is fixed; clipboard restore preserves text
+only; there is no floating dictation pill or tray overlay yet (Phase 5).
+
 ## Phases
 
 | Phase | Scope | Status |
 | --- | --- | --- |
 | 1 | Workspace, Rune shell, first-run setup, Windows permission/GPU probes, CI | Done |
 | 2 | Model manager: download, resume, verify, activate, warm up, GPU providers | Done |
-| 3 | Audio capture, VAD, Whisper transcription, dictation hotkey, text insertion | Next |
-| 4 | Command planner/actions, Windows app/URL/volume/media/files/settings | Planned |
+| 3 | Audio capture, VAD, Whisper transcription, dictation hotkey, text insertion | Done |
+| 4 | Command planner/actions, Windows app/URL/volume/media/files/settings | Next |
 | 5 | Routines, insights, tray, startup, hotkey settings, UI parity | Planned |
 | 6 | Packaging (MSIX/NSIS), release artifacts, performance hardening | Planned |
 

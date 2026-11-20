@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use std::sync::mpsc::Sender;
+
 use jarvis_core::setup::{Consent, GpuInfo, MicrophoneAccess};
 
 pub fn microphone() -> MicrophoneAccess {
@@ -35,4 +37,36 @@ pub fn open_path(path: &Path) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HotkeyEvent {
+    Pressed,
+}
+
+pub struct HotkeyRegistration;
+
+impl HotkeyRegistration {
+    pub fn stop(&mut self) {}
+}
+
+pub fn start_dictation_hotkey(
+    _sender: Sender<HotkeyEvent>,
+    _waker: crate::Wake,
+) -> Result<HotkeyRegistration, String> {
+    Err("Global dictation hotkeys are Windows-only in this preview.".into())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertionOutcome {
+    Pasted,
+    ClipboardOnly,
+}
+
+pub fn insert_text(_text: &str) -> Result<InsertionOutcome, String> {
+    Err("Automatic text insertion is Windows-only in this preview.".into())
+}
+
+pub fn copy_text(_text: &str) -> Result<(), String> {
+    Err("Clipboard copy is Windows-only in this preview.".into())
 }

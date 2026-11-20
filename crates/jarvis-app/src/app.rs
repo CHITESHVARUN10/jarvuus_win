@@ -7,6 +7,8 @@ use jarvis_core::paths::AppPaths;
 use jarvis_core::settings::{AppSettings, ThemeChoice};
 use jarvis_core::setup::{SetupAction, SetupItem, SetupKind, SetupReport, SetupStatus};
 use jarvis_models::manager::{ModelKind, ModelManager, ModelPhase, ModelUpdate};
+use jarvis_platform::{HotkeyEvent, HotkeyRegistration, InsertionOutcome};
+use jarvis_speech::{DictationController, DictationState, SpeechEvent};
 use rune::{Tx, Waker};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +145,127 @@ impl ModelsUi {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct SpeechUi {
+    pub session: u64,
+    pub state: DictationState,
+    pub detail: String,
+    pub level: f32,
+    pub partial: String,
+    pub transcript: Option<String>,
+    pub backend: Option<String>,
+    pub model_loaded: bool,
+    pub model_detail: String,
+    pub device: Option<String>,
+    pub hotkey_error: Option<String>,
+    pub insertion: Option<String>,
+}
+
+impl SpeechUi {
+    pub fn new() -> Self {
+        Self {
+            session: 0,
+            state: DictationState::Idle,
+            detail: "Press Ctrl + Shift + D or Start to dictate.".into(),
+            level: 0.0,
+            partial: String::new(),
+            transcript: None,
+            backend: None,
+            model_loaded: false,
+            model_detail: "The speech model loads on first use.".into(),
+            device: None,
+            hotkey_error: None,
+            insertion: None,
+        }
+    }
+
+    pub fn apply(&mut self, event: SpeechEvent) -> bool {
+        match event {
+            SpeechEvent::State {
+                session,
+                state,
+                detail,
+            } => {
+                self.session = session;
+                self.state = state;
+                self.detail = detail;
+                if state != DictationState::Listening {
+                    self.level = 0.0;
+                }
+                if state == DictationState::Listening {
+                    self.partial.clear();
+                    self.transcript = None;
+                    self.insertion = None;
+                }
+                if matches!(state, DictationState::Processing | DictationState::Idle) {
+                    self.partial.clear();
+                }
+                true
+            }
+            SpeechEvent::Device { session, name } if session == self.session => {
+                self.device = Some(name);
+                true
+            }
+            SpeechEvent::Level { session, level } if session == self.session => {
+                self.level = level.clamp(0.0, 1.0);
+                true
+            }
+            SpeechEvent::Partial { session, text } if session == self.session => {
+                self.partial = text;
+                true
+            }
+            SpeechEvent::Final {
+                session,
+                text,
+                backend,
+            } if session == self.session => {
+                self.state = DictationState::Ready;
+                self.detail = "Transcript ready.".into();
+                self.transcript = Some(text);
+                self.partial.clear();
+                self.level = 0.0;
+                self.backend = Some(backend);
+                self.insertion = None;
+                true
+            }
+            SpeechEvent::Model {
+                session,
+                loaded,
+                backend,
+                detail,
+            } if session == 0 || session == self.session => {
+                self.model_loaded = loaded;
+                self.model_detail = detail;
+                if let Some(backend) = backend {
+                    self.backend = Some(backend);
+                } else if !loaded {
+                    self.backend = None;
+                }
+                true
+            }
+            SpeechEvent::AudioLimit { session } if session == self.session => {
+                self.detail = "Maximum dictation length reached. Stopping.".into();
+                true
+            }
+            SpeechEvent::Error { session, message } if session == 0 || session == self.session => {
+                self.state = DictationState::Error;
+                self.detail = message;
+                self.partial.clear();
+                self.level = 0.0;
+                self.insertion = None;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Default for SpeechUi {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct Jarvis {
     pub paths: AppPaths,
     pub settings: AppSettings,
@@ -155,8 +278,16 @@ pub struct Jarvis {
     pub version: &'static str,
     pub models: ModelsUi,
     pub model_manager: ModelManager,
+    pub speech: SpeechUi,
+    pub dictation: DictationController,
+    pub hotkey: Option<HotkeyRegistration>,
     rx: Option<Receiver<SetupReport>>,
     model_rx: Receiver<ModelUpdate>,
+    speech_rx: Receiver<SpeechEvent>,
+    insertion_tx: mpsc::Sender<Result<InsertionOutcome, String>>,
+    insertion_rx: Receiver<Result<InsertionOutcome, String>>,
+    hotkey_tx: mpsc::Sender<HotkeyEvent>,
+    hotkey_rx: Receiver<HotkeyEvent>,
     waker: Option<Waker>,
 }
 
@@ -191,6 +322,11 @@ impl Jarvis {
         };
         let (model_sender, model_rx) = mpsc::channel();
         let model_manager = ModelManager::new(paths.clone(), model_sender);
+        let speech = SpeechUi::new();
+        let (speech_sender, speech_rx) = mpsc::channel();
+        let dictation = DictationController::new(paths.clone(), speech_sender);
+        let (insertion_tx, insertion_rx) = mpsc::channel();
+        let (hotkey_tx, hotkey_rx) = mpsc::channel();
 
         Self {
             paths,
@@ -204,8 +340,16 @@ impl Jarvis {
             version: env!("CARGO_PKG_VERSION"),
             models,
             model_manager,
+            speech,
+            dictation,
+            hotkey: None,
             rx: None,
             model_rx,
+            speech_rx,
+            insertion_tx,
+            insertion_rx,
+            hotkey_tx,
+            hotkey_rx,
             waker: None,
         }
     }
@@ -229,6 +373,11 @@ impl Jarvis {
         };
         let (model_sender, model_rx) = mpsc::channel();
         let model_manager = ModelManager::new(paths.clone(), model_sender);
+        let speech = SpeechUi::new();
+        let (speech_sender, speech_rx) = mpsc::channel();
+        let dictation = DictationController::new(paths.clone(), speech_sender);
+        let (insertion_tx, insertion_rx) = mpsc::channel();
+        let (hotkey_tx, hotkey_rx) = mpsc::channel();
         Self {
             paths,
             settings,
@@ -249,8 +398,16 @@ impl Jarvis {
             version: env!("CARGO_PKG_VERSION"),
             models,
             model_manager,
+            speech,
+            dictation,
+            hotkey: None,
             rx: None,
             model_rx,
+            speech_rx,
+            insertion_tx,
+            insertion_rx,
+            hotkey_tx,
+            hotkey_rx,
             waker: None,
         }
     }
@@ -356,6 +513,119 @@ impl Jarvis {
         };
         self.setup.update_item(kind, status, update.detail.clone());
         self.models.apply(update);
+    }
+
+    pub fn start_dictation(&mut self) {
+        if let Err(error) = self.dictation.start() {
+            self.speech.state = DictationState::Error;
+            self.speech.detail = error;
+            self.speech.partial.clear();
+            self.speech.insertion = None;
+        }
+    }
+
+    pub fn stop_dictation(&mut self) {
+        self.dictation.stop();
+    }
+
+    pub fn cancel_dictation(&mut self) {
+        self.dictation.cancel();
+    }
+
+    pub fn toggle_dictation(&mut self) {
+        match self.speech.state {
+            DictationState::Listening => self.stop_dictation(),
+            DictationState::Processing => self.cancel_dictation(),
+            _ => self.start_dictation(),
+        }
+    }
+
+    pub fn register_hotkey(&mut self) {
+        let waker: Waker = self
+            .waker
+            .clone()
+            .unwrap_or_else(|| std::sync::Arc::new(|| {}));
+        match jarvis_platform::start_dictation_hotkey(self.hotkey_tx.clone(), waker) {
+            Ok(handle) => {
+                self.hotkey = Some(handle);
+                self.speech.hotkey_error = None;
+            }
+            Err(error) => self.speech.hotkey_error = Some(error),
+        }
+    }
+
+    pub fn copy_transcript(&mut self) {
+        let Some(text) = self.speech.transcript.clone() else {
+            return;
+        };
+        match jarvis_platform::copy_text(&text) {
+            Ok(()) => {
+                self.speech.insertion = Some("Transcript copied to the clipboard.".into());
+                self.notice = Some(Notice::info("Transcript copied to the clipboard."));
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(format!(
+                    "Could not copy the transcript: {error}"
+                )));
+            }
+        }
+    }
+
+    pub fn apply_speech_event(&mut self, event: SpeechEvent) {
+        let audio_limit = matches!(event, SpeechEvent::AudioLimit { .. });
+        let error = matches!(event, SpeechEvent::Error { .. });
+        let final_text = match &event {
+            SpeechEvent::Final { text, .. } => Some(text.clone()),
+            _ => None,
+        };
+        if !self.speech.apply(event) {
+            return;
+        }
+        if let Some(text) = final_text {
+            self.start_insertion(text);
+        }
+        if audio_limit {
+            self.stop_dictation();
+        }
+        if error {
+            self.dictation.abort();
+        }
+    }
+
+    fn start_insertion(&mut self, text: String) {
+        self.speech.insertion = Some("Pasting at the cursor...".into());
+        let sender = self.insertion_tx.clone();
+        let waker = self.waker.clone();
+        std::thread::spawn(move || {
+            let result = jarvis_platform::insert_text(&text);
+            let _ = sender.send(result);
+            if let Some(waker) = waker {
+                waker();
+            }
+        });
+    }
+
+    fn apply_insertion_result(&mut self, result: Result<InsertionOutcome, String>) {
+        match result {
+            Ok(InsertionOutcome::Pasted) => {
+                self.speech.insertion = Some("Pasted at the cursor.".into());
+            }
+            Ok(InsertionOutcome::ClipboardOnly) => {
+                self.speech.insertion =
+                    Some("Copied to the clipboard. Press Ctrl+V in the target window.".into());
+                self.notice = Some(Notice::info(
+                    "The active window blocks automated input. The transcript is on the clipboard.",
+                ));
+            }
+            Err(error) => {
+                self.speech.insertion = Some(format!(
+                    "Automatic paste unavailable: {error}. Use Copy transcript."
+                ));
+                self.notice = Some(Notice::error(format!(
+                    "Automatic paste unavailable: {error}"
+                )));
+            }
+        }
     }
 
     pub fn finish_setup(&mut self) {
@@ -494,8 +764,12 @@ impl Default for Jarvis {
 pub fn setup_hook(state: &mut Jarvis, waker: Waker) {
     state.waker = Some(waker.clone());
     state.model_manager.set_notifier(waker.clone());
+    state.dictation.set_notifier(waker.clone());
     if state.setup.checked_at.is_some() {
         return;
+    }
+    if state.hotkey.is_none() && state.speech.hotkey_error.is_none() {
+        state.register_hotkey();
     }
     state.start_setup_probe(waker);
 }
@@ -504,6 +778,20 @@ pub fn poll(state: &mut Jarvis, _clock: f64, _tx: &mut Tx) -> bool {
     let mut changed = false;
     while let Ok(update) = state.model_rx.try_recv() {
         state.apply_model_update(update);
+        changed = true;
+    }
+    while let Ok(event) = state.speech_rx.try_recv() {
+        state.apply_speech_event(event);
+        changed = true;
+    }
+    while let Ok(event) = state.hotkey_rx.try_recv() {
+        if event == HotkeyEvent::Pressed {
+            state.toggle_dictation();
+            changed = true;
+        }
+    }
+    while let Ok(result) = state.insertion_rx.try_recv() {
+        state.apply_insertion_result(result);
         changed = true;
     }
 
@@ -573,6 +861,42 @@ mod tests {
         assert_eq!(partial.essentials_ready, 1);
         assert!(ready.essentials_complete());
         assert_eq!(ready.essentials_total, 3);
+    }
+
+    #[test]
+    fn speech_events_drive_the_voice_state() {
+        let mut ui = SpeechUi::new();
+        assert!(ui.apply(SpeechEvent::State {
+            session: 1,
+            state: DictationState::Listening,
+            detail: "Listening".into(),
+        }));
+        assert_eq!(ui.state, DictationState::Listening);
+
+        assert!(ui.apply(SpeechEvent::Level {
+            session: 1,
+            level: 0.55
+        }));
+        assert_eq!(ui.level, 0.55);
+        assert!(!ui.apply(SpeechEvent::Level {
+            session: 2,
+            level: 1.0
+        }));
+
+        assert!(ui.apply(SpeechEvent::Partial {
+            session: 1,
+            text: "hello".into()
+        }));
+        assert_eq!(ui.partial, "hello");
+
+        assert!(ui.apply(SpeechEvent::Final {
+            session: 1,
+            text: "hello world".into(),
+            backend: "cpu".into()
+        }));
+        assert_eq!(ui.state, DictationState::Ready);
+        assert_eq!(ui.transcript.as_deref(), Some("hello world"));
+        assert_eq!(ui.backend.as_deref(), Some("cpu"));
     }
 
     #[test]

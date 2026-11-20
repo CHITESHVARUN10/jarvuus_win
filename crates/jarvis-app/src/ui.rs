@@ -2,6 +2,7 @@ use jarvis_core::models;
 use jarvis_core::setup::{SetupItem, SetupStatus};
 use jarvis_core::ThemeChoice;
 use jarvis_models::manager::{ModelKind, ModelPhase};
+use jarvis_speech::DictationState;
 use rune::tok::{self, radius, space, type_, Theme};
 use rune::{col, el, oklch, row, text, Color, Cx, El, ScrollSpec, TextStyle};
 
@@ -50,9 +51,8 @@ pub fn view(state: &Jarvis, cx: &mut Cx<Jarvis>) -> El {
 fn main(state: &Jarvis, p: Paint) -> El {
     let page = match state.section {
         Section::Assistant => assistant_page(state, p),
-        Section::Voice | Section::Routines | Section::Insights => {
-            placeholder_page(state.section, p)
-        }
+        Section::Voice => voice_page(state, p),
+        Section::Routines | Section::Insights => placeholder_page(state.section, p),
         Section::Appearance => appearance_page(state, p),
         Section::Settings => settings_page(state, p),
     };
@@ -315,7 +315,7 @@ fn sidebar_footer(state: &Jarvis, p: Paint) -> El {
                 .justify_between()
                 .gap(10.0)
                 .child(
-                    text(format!("v{} · phase 2", state.version))
+                    text(format!("v{} · phase 3", state.version))
                         .font(TextStyle::new(11.0, 500.0))
                         .color(p.t.text_secondary),
                 )
@@ -884,6 +884,272 @@ fn setup_finish(state: &Jarvis, p: Paint) -> El {
     )
 }
 
+fn voice_page(state: &Jarvis, p: Paint) -> El {
+    let speech = &state.speech;
+    let color = match speech.state {
+        DictationState::Idle => p.t.text_secondary,
+        DictationState::Listening => p.accent,
+        DictationState::Processing => warning_color(),
+        DictationState::Ready => success_color(),
+        DictationState::Error => danger_color(),
+    };
+    let speech_ready = matches!(
+        state.models.speech.phase,
+        ModelPhase::Installed | ModelPhase::Ready
+    );
+    let level = speech.level.clamp(0.0, 1.0);
+    let level_fill = (level * 220.0).max(if level > 0.0 { 4.0 } else { 0.0 });
+    let engine = if speech.model_loaded {
+        speech
+            .backend
+            .as_ref()
+            .map(|backend| format!("Whisper · {backend}"))
+            .unwrap_or_else(|| "Whisper loaded".into())
+    } else {
+        speech.model_detail.clone()
+    };
+    let transcript = if !speech.partial.is_empty() {
+        Some(speech.partial.clone())
+    } else {
+        speech.transcript.clone()
+    };
+    let primary = if !speech_ready {
+        primary_button(p, "voice-toggle", "Install speech model", true, |state| {
+            state.open_settings(SettingsPage::Setup)
+        })
+    } else {
+        let label = match speech.state {
+            DictationState::Listening => "Stop and transcribe",
+            DictationState::Processing => "Cancel transcription",
+            _ => "Start dictation",
+        };
+        primary_button(p, "voice-toggle", label, true, |state| {
+            state.toggle_dictation()
+        })
+    };
+
+    col()
+        .key("voice-page")
+        .w_full()
+        .max_w(820.0)
+        .gap(16.0)
+        .child(
+            card(p, "voice-card")
+                .child(section_heading(p, "Dictation"))
+                .child(
+                    row()
+                        .gap(10.0)
+                        .center_y()
+                        .child(el().size(10.0, 10.0).radius(5.0).fill(color).a11y_hidden())
+                        .child(
+                            row()
+                                .h(22.0)
+                                .px(8.0)
+                                .radius(11.0)
+                                .center()
+                                .fill(color.alpha(0.14))
+                                .child(
+                                    text(speech.state.label())
+                                        .font(type_::LABEL)
+                                        .color(color),
+                                ),
+                        )
+                        .child(
+                            text(speech.detail.clone())
+                                .font(type_::BODY)
+                                .color(p.t.text_secondary),
+                        ),
+                )
+                .child(
+                    row()
+                        .key("voice-level")
+                        .gap(12.0)
+                        .center_y()
+                        .child(
+                            row()
+                                .h(8.0)
+                                .w(220.0)
+                                .radius(4.0)
+                                .fill(p.t.control_off)
+                                .child(
+                                    el().key("voice-level-fill")
+                                        .h(8.0)
+                                        .w(level_fill)
+                                        .radius(4.0)
+                                        .fill(if speech.state == DictationState::Listening {
+                                            p.accent
+                                        } else {
+                                            p.t.text_secondary
+                                        })
+                                        .motion(tok::motion::SNAPPY),
+                                ),
+                        )
+                        .child(
+                            text(if speech.state == DictationState::Listening {
+                                "Live input"
+                            } else {
+                                "Input level"
+                            })
+                            .font(type_::LABEL)
+                            .color(p.t.text_secondary),
+                        ),
+                )
+                .child(
+                    row().gap(8.0).pt(4.0).child(primary).child(secondary_button(
+                        p,
+                        "voice-cancel",
+                        "Cancel",
+                        speech.state.is_active(),
+                        |state| state.cancel_dictation(),
+                    ))
+                    .child(secondary_button(
+                        p,
+                        "voice-copy",
+                        "Copy transcript",
+                        speech.transcript.is_some(),
+                        |state| state.copy_transcript(),
+                    )),
+                )
+                .child(
+                    row()
+                        .w_full()
+                        .gap(12.0)
+                        .justify_between()
+                        .center_y()
+                        .child(
+                            text("Hotkey")
+                                .font(type_::BODY)
+                                .color(p.t.text_secondary),
+                        )
+                        .child(
+                            row()
+                                .key("voice-hotkey")
+                                .gap(8.0)
+                                .center_y()
+                                .child(
+                                    row()
+                                        .h(24.0)
+                                        .px(8.0)
+                                        .radius(radius::SM)
+                                        .fill(p.t.control_track)
+                                        .center()
+                                        .child(
+                                            text("Ctrl + Shift + D")
+                                                .font(type_::MONO_CAPTION)
+                                                .color(p.t.text),
+                                        ),
+                                )
+                                .child(if let Some(error) = &speech.hotkey_error {
+                                    text(if cfg!(windows) {
+                                        format!("Unavailable · {error}")
+                                    } else {
+                                        "Windows only".to_string()
+                                    })
+                                    .font(type_::LABEL)
+                                    .color(warning_color())
+                                } else {
+                                    text("Global")
+                                        .font(type_::LABEL)
+                                        .color(success_color())
+                                }),
+                        ),
+                )
+                .child(info_row(
+                    p,
+                    "Microphone",
+                    speech
+                        .device
+                        .as_deref()
+                        .unwrap_or("Default input device"),
+                ))
+                .child(info_row(p, "Engine", &engine))
+                .child(
+                    if !speech_ready {
+                        row()
+                            .w_full()
+                            .gap(10.0)
+                            .center_y()
+                            .justify_between()
+                            .child(
+                                text("The speech model is not ready yet.")
+                                    .font(type_::LABEL)
+                                    .color(warning_color()),
+                            )
+                            .child(secondary_button(
+                                p,
+                                "voice-open-setup",
+                                "Open Setup",
+                                true,
+                                |state| state.open_settings(SettingsPage::Setup),
+                            ))
+                    } else {
+                        row()
+                    },
+                )
+                .child(if speech.hotkey_error.is_some() && cfg!(windows) {
+                    row().w_full().justify_end().child(link_button(
+                        p,
+                        "voice-retry-hotkey",
+                        "Retry hotkey",
+                        |state| state.register_hotkey(),
+                    ))
+                } else {
+                    row()
+                }),
+        )
+        .child(
+            card(p, "voice-transcript-card")
+                .child(section_heading(p, "Transcript"))
+                .child(
+                    text(
+                        transcript
+                            .clone()
+                            .unwrap_or_else(|| {
+                                "Start dictation to see your words here.".into()
+                            }),
+                    )
+                    .key("voice-transcript-text")
+                    .w_full()
+                    .font(if speech.partial.is_empty() {
+                        type_::BODY
+                    } else {
+                        TextStyle::new(16.0, 450.0)
+                    })
+                    .color(if transcript.is_some() {
+                        p.t.text
+                    } else {
+                        p.t.text_secondary
+                    }),
+                )
+                .child(if let Some(insertion) = &speech.insertion {
+                    text(insertion.clone())
+                        .font(type_::LABEL)
+                        .color(p.t.text_secondary)
+                } else {
+                    row()
+                }),
+        )
+        .child(
+            card(p, "voice-help-card")
+                .child(section_heading(p, "How dictation works"))
+                .child(
+                    text("Press Ctrl + Shift + D anywhere to start, then press it again to stop. The transcript is pasted into the window you were using.")
+                        .font(type_::BODY)
+                        .color(p.t.text_secondary),
+                )
+                .child(
+                    text("If Windows blocks synthetic input into an elevated app, Jarvis leaves the transcript on the clipboard instead.")
+                        .font(type_::LABEL)
+                        .color(p.t.text_secondary),
+                )
+                .child(
+                    text("Audio stays on this machine. Whisper runs locally.")
+                        .font(type_::LABEL)
+                        .color(p.t.text_secondary),
+                ),
+        )
+}
+
 fn general_page(state: &Jarvis, p: Paint) -> El {
     let speech_path = models::whisper_model_path(&state.paths);
     let intent_path = state.paths.intent_dir.display().to_string();
@@ -1074,7 +1340,7 @@ fn about_page(state: &Jarvis, p: Paint) -> El {
                 .child(section_heading(p, "About"))
                 .child(info_row(p, "Application", "Jarvis for Windows"))
                 .child(info_row(p, "Version", state.version))
-                .child(info_row(p, "Build", "Phase 2 · model manager"))
+                .child(info_row(p, "Build", "Phase 3 · dictation"))
                 .child(info_row(p, "Platform", std::env::consts::OS))
                 .child(info_row(
                     p,
@@ -1136,7 +1402,7 @@ fn placeholder_page(section: Section, p: Paint) -> El {
         .child(
             card(p, "placeholder-card")
                 .child(
-                    text("This screen arrives in a later build. Phase 2 ships the app shell, setup, verified model downloads and runtime warm-up.")
+                    text("This screen arrives in a later build. Phase 3 ships the app shell, setup, model downloads and local dictation.")
                         .font(type_::BODY)
                         .color(p.t.text_secondary),
                 )
@@ -1359,6 +1625,39 @@ mod tests {
         assert!(runtime.find("model-progress-speech").is_some());
         assert!(runtime.find("cancel-speech-model").is_some());
         assert!(runtime.find("download-speech-model").is_none());
+    }
+
+    #[test]
+    fn the_voice_page_shows_dictation_controls() {
+        let mut state = Jarvis::for_test();
+        state.section = Section::Voice;
+        let mut runtime = Runtime::new(state, view, (1120.0, 760.0), Env::new(true, 1.0));
+        runtime.frame(0.0);
+
+        assert!(runtime.find("voice-page").is_some());
+        assert!(runtime.find("voice-toggle").is_some());
+        assert!(runtime.find("voice-cancel").is_some());
+        assert!(runtime.find("voice-copy").is_some());
+        assert!(runtime.find("voice-level").is_some());
+        assert!(runtime.find("voice-hotkey").is_some());
+        assert!(runtime.find("voice-transcript-card").is_some());
+        assert!(runtime.find("voice-open-setup").is_some());
+    }
+
+    #[test]
+    fn a_final_transcript_is_rendered_in_the_voice_page() {
+        let mut state = Jarvis::for_test();
+        state.section = Section::Voice;
+        state.speech.state = DictationState::Ready;
+        state.speech.detail = "Transcript ready.".into();
+        state.speech.transcript = Some("hello from jarvis".into());
+        state.speech.backend = Some("cpu".into());
+        state.speech.model_loaded = true;
+        let mut runtime = Runtime::new(state, view, (1120.0, 760.0), Env::new(true, 1.0));
+        runtime.frame(0.0);
+
+        assert!(runtime.find("voice-transcript-text").is_some());
+        assert!(runtime.find("voice-copy").is_some());
     }
 
     #[test]

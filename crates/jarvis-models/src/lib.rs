@@ -6,6 +6,9 @@ pub mod manager;
 pub mod manifest;
 pub mod speech;
 
+#[cfg(feature = "inference")]
+pub use engines::whisper::WhisperEngine;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
