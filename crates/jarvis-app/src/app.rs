@@ -10,6 +10,7 @@ use jarvis_core::paths::AppPaths;
 use jarvis_core::routines::RoutineStore;
 use jarvis_core::settings::{AppSettings, ThemeChoice};
 use jarvis_core::setup::{SetupAction, SetupItem, SetupKind, SetupReport, SetupStatus};
+use jarvis_core::update;
 use jarvis_models::manager::{ModelKind, ModelManager, ModelPhase, ModelUpdate};
 use jarvis_platform::{HotkeyEvent, HotkeyRegistration, InsertionOutcome};
 use jarvis_speech::{DictationController, DictationState, SpeechEvent};
@@ -98,6 +99,7 @@ fn hotkey_from_event(event: &KeyEvent) -> Option<Hotkey> {
 }
 
 use crate::command::{CommandEvent, CommandService, CommandUi};
+use crate::updates::{self as update_ui, UpdateEvent, UpdateService, UpdatesUi};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
@@ -146,13 +148,15 @@ impl Section {
 pub enum SettingsPage {
     Setup,
     General,
+    Updates,
     About,
 }
 
 impl SettingsPage {
-    pub const ALL: [SettingsPage; 3] = [
+    pub const ALL: [SettingsPage; 4] = [
         SettingsPage::Setup,
         SettingsPage::General,
+        SettingsPage::Updates,
         SettingsPage::About,
     ];
 
@@ -160,6 +164,7 @@ impl SettingsPage {
         match self {
             SettingsPage::Setup => "Setup",
             SettingsPage::General => "General",
+            SettingsPage::Updates => "Updates",
             SettingsPage::About => "About",
         }
     }
@@ -168,6 +173,7 @@ impl SettingsPage {
         match self {
             SettingsPage::Setup => "setup",
             SettingsPage::General => "general",
+            SettingsPage::Updates => "updates",
             SettingsPage::About => "about",
         }
     }
@@ -404,6 +410,9 @@ pub struct Jarvis {
     pub routine_command: TextEdit,
     pub routine_error: Option<String>,
     pub insights: Insights,
+    pub updates: UpdatesUi,
+    update_service: UpdateService,
+    pub auto_update_attempted: bool,
     pub hotkey_target: Option<HotkeyTarget>,
     pub hotkey_message: Option<String>,
     pub hotkey: Option<HotkeyRegistration>,
@@ -468,6 +477,7 @@ impl Jarvis {
         let routines = RoutineStore::load(&paths.routines_file);
         let insights = Insights::load(&paths.insights_file);
         let (tray_tx, tray_rx) = mpsc::channel();
+        let update_service = UpdateService::new(paths.clone());
 
         Self {
             paths,
@@ -489,6 +499,9 @@ impl Jarvis {
             routine_command: TextEdit::default(),
             routine_error: None,
             insights,
+            updates: UpdatesUi::new(update::current_version()),
+            update_service,
+            auto_update_attempted: false,
             hotkey_target: None,
             hotkey_message: None,
             hotkey: None,
@@ -540,6 +553,7 @@ impl Jarvis {
         let routines = RoutineStore::load(&paths.routines_file);
         let insights = Insights::load(&paths.insights_file);
         let (tray_tx, tray_rx) = mpsc::channel();
+        let update_service = UpdateService::new(paths.clone());
         Self {
             paths,
             settings,
@@ -568,6 +582,9 @@ impl Jarvis {
             routine_command: TextEdit::default(),
             routine_error: None,
             insights,
+            updates: UpdatesUi::new(update::current_version()),
+            update_service,
+            auto_update_attempted: false,
             hotkey_target: None,
             hotkey_message: None,
             hotkey: None,
@@ -613,6 +630,155 @@ impl Jarvis {
     pub fn set_accent(&mut self, accent: u8) {
         self.settings.accent = accent.min(5);
         self.save_settings();
+    }
+
+    pub fn set_update_channel(&mut self, channel: jarvis_core::UpdateChannel) {
+        self.settings.update_channel = channel;
+        self.save_settings();
+    }
+
+    pub fn set_check_for_updates(&mut self, enabled: bool) {
+        self.settings.check_for_updates = enabled;
+        self.save_settings();
+        if !enabled {
+            self.updates.phase = crate::updates::UpdatePhase::Idle;
+            self.updates.latest = None;
+            self.updates.error = None;
+        }
+    }
+
+    pub fn set_auto_download_updates(&mut self, enabled: bool) {
+        self.settings.auto_download_updates = enabled;
+        self.save_settings();
+    }
+
+    pub fn check_for_updates(&mut self) {
+        if self.updates.phase.is_busy() {
+            return;
+        }
+        let Some(waker) = self.waker.clone() else {
+            self.notice = Some(Notice::info("Updater waits for the first frame."));
+            return;
+        };
+        self.update_service.check(waker);
+    }
+
+    pub fn download_update(&mut self) {
+        let (Some(release), Some(asset)) =
+            (self.updates.latest.clone(), self.updates.asset().cloned())
+        else {
+            return;
+        };
+        if !self.updates.can_download() {
+            return;
+        }
+        let Some(waker) = self.waker.clone() else {
+            self.notice = Some(Notice::info("Updater waits for the first frame."));
+            return;
+        };
+        self.update_service.download(release, asset, waker);
+    }
+
+    /// Starts the verified installer and quits so it can replace `jarvis.exe`.
+    /// `AppHandle::quit` is used because UI callbacks only receive `&mut Jarvis`.
+    pub fn install_update(&mut self) {
+        let Some(path) = self.updates.installer.clone() else {
+            return;
+        };
+        match jarvis_platform::launch_installer(&path, false) {
+            Ok(()) => {
+                let version = self
+                    .updates
+                    .latest_version()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                logging::info(
+                    &self.paths.log_file,
+                    &format!("update installer started · {version}"),
+                );
+                let current = self.updates.current.clone();
+                self.updates.apply(
+                    UpdateEvent::InstallStarted,
+                    self.settings.update_channel,
+                    &current,
+                );
+                self.notice = Some(Notice::info(format!(
+                    "Installing Jarvis {version}. Jarvis will restart when the installer finishes."
+                )));
+                if let Some(app) = app_handle() {
+                    app.quit();
+                }
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(format!(
+                    "Could not start the installer: {error}"
+                )));
+            }
+        }
+    }
+
+    pub fn reveal_update(&mut self) {
+        let Some(path) = self.updates.installer.clone() else {
+            return;
+        };
+        if let Err(error) = jarvis_platform::reveal_path(&path) {
+            self.notice = Some(Notice::error(format!(
+                "Could not open the update folder: {error}"
+            )));
+        }
+    }
+
+    fn maybe_auto_check(&mut self) {
+        if self.auto_update_attempted || !update_ui::should_check(&self.settings, &self.paths) {
+            return;
+        }
+        self.auto_update_attempted = true;
+        self.check_for_updates();
+    }
+
+    fn apply_update_event(&mut self, event: UpdateEvent) {
+        let channel = self.settings.update_channel;
+        let current = self.updates.current.clone();
+        let changed = self.updates.apply(event, channel, &current);
+        if !changed {
+            return;
+        }
+        if matches!(
+            self.updates.phase,
+            crate::updates::UpdatePhase::Available | crate::updates::UpdatePhase::UpToDate
+        ) {
+            let checked_at = chrono::Utc::now().to_rfc3339();
+            self.updates.last_checked = Some(checked_at.clone());
+            let receipt = update_ui::UpdateReceipt {
+                version: self
+                    .updates
+                    .latest_version()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| self.version.to_string()),
+                checked_at,
+            };
+            update_ui::save_receipt(&self.paths, &receipt);
+        }
+        logging::info(
+            &self.paths.log_file,
+            &format!(
+                "updates · {} · {}",
+                self.updates.phase.label(),
+                self.updates
+                    .latest_version()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "no release".into())
+            ),
+        );
+        if self.settings.auto_download_updates
+            && self.updates.can_download()
+            && self
+                .updates
+                .asset()
+                .is_some_and(|asset| asset.sha256.is_some())
+        {
+            self.download_update();
+        }
     }
 
     pub fn refresh_setup(&mut self) {
@@ -1296,6 +1462,7 @@ impl Default for Jarvis {
 
 pub fn setup_hook(state: &mut Jarvis, waker: Waker) {
     state.waker = Some(waker.clone());
+    state.maybe_auto_check();
     state.model_manager.set_notifier(waker.clone());
     state.dictation.set_notifier(waker.clone());
     state.command_service.set_notifier(waker.clone());
@@ -1314,6 +1481,10 @@ pub fn setup_hook(state: &mut Jarvis, waker: Waker) {
 pub fn poll(state: &mut Jarvis, _clock: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
     changed |= state.ensure_tray();
+    for event in state.update_service.drain() {
+        state.apply_update_event(event);
+        changed = true;
+    }
     while let Ok(update) = state.model_rx.try_recv() {
         state.apply_model_update(update);
         changed = true;
@@ -1373,7 +1544,6 @@ fn window_handle() -> Option<WindowHandle> {
     WINDOW_HANDLE.get().cloned()
 }
 
-#[cfg(windows)]
 fn app_handle() -> Option<AppHandle<Jarvis>> {
     APP_HANDLE.get().cloned()
 }

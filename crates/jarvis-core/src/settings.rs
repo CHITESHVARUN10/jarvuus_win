@@ -33,6 +33,39 @@ impl ThemeChoice {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    #[default]
+    Stable,
+    Prerelease,
+}
+
+impl UpdateChannel {
+    pub const ALL: [UpdateChannel; 2] = [UpdateChannel::Stable, UpdateChannel::Prerelease];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            UpdateChannel::Stable => "Stable",
+            UpdateChannel::Prerelease => "Prerelease",
+        }
+    }
+
+    pub fn detail(self) -> &'static str {
+        match self {
+            UpdateChannel::Stable => "Final releases only.",
+            UpdateChannel::Prerelease => "Include beta and release-candidate builds.",
+        }
+    }
+
+    pub fn accepts(self, version: &semver::Version) -> bool {
+        match self {
+            UpdateChannel::Stable => version.pre.is_empty(),
+            UpdateChannel::Prerelease => true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -45,6 +78,9 @@ pub struct AppSettings {
     pub launch_at_login: bool,
     pub close_to_tray: bool,
     pub microphone: Option<String>,
+    pub update_channel: UpdateChannel,
+    pub check_for_updates: bool,
+    pub auto_download_updates: bool,
 }
 
 impl Default for AppSettings {
@@ -59,6 +95,9 @@ impl Default for AppSettings {
             launch_at_login: false,
             close_to_tray: true,
             microphone: None,
+            update_channel: UpdateChannel::Stable,
+            check_for_updates: true,
+            auto_download_updates: false,
         }
     }
 }
@@ -95,6 +134,19 @@ mod tests {
         assert_eq!(settings.command_hotkey, "Ctrl+Shift+A");
         assert!(settings.close_to_tray);
         assert!(!settings.launch_at_login);
+        assert!(settings.check_for_updates);
+        assert!(!settings.auto_download_updates);
+        assert_eq!(settings.update_channel, UpdateChannel::Stable);
+    }
+
+    #[test]
+    fn update_channels_filter_prereleases() {
+        let stable = semver::Version::parse("0.2.0").unwrap();
+        let beta = semver::Version::parse("0.2.0-beta.1").unwrap();
+        assert!(UpdateChannel::Stable.accepts(&stable));
+        assert!(!UpdateChannel::Stable.accepts(&beta));
+        assert!(UpdateChannel::Prerelease.accepts(&stable));
+        assert!(UpdateChannel::Prerelease.accepts(&beta));
     }
 
     #[test]

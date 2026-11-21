@@ -1853,12 +1853,16 @@ checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 name = "jarvis-app"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "jarvis-commands",
  "jarvis-core",
  "jarvis-models",
  "jarvis-platform",
  "jarvis-speech",
  "rune",
+ "semver",
+ "serde",
+ "serde_json",
  "tempfile",
  "winresource",
 ]
@@ -1884,8 +1888,10 @@ dependencies = [
  "chrono",
  "dirs",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
 ]

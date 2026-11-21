@@ -319,7 +319,7 @@ fn sidebar_footer(state: &Jarvis, p: Paint) -> El {
                 .justify_between()
                 .gap(10.0)
                 .child(
-                    text(format!("v{} · phase 6", state.version))
+                    text(format!("v{} · phase 7", state.version))
                         .font(TextStyle::new(11.0, 500.0))
                         .color(p.t.text_secondary),
                 )
@@ -762,6 +762,7 @@ fn settings_page(state: &Jarvis, p: Paint) -> El {
     let content = match state.settings_page {
         SettingsPage::Setup => setup_page(state, p),
         SettingsPage::General => general_page(state, p),
+        SettingsPage::Updates => updates_page(state, p),
         SettingsPage::About => about_page(state, p),
     };
 
@@ -1793,6 +1794,262 @@ fn theme_segments(state: &Jarvis, p: Paint) -> El {
     segments
 }
 
+fn updates_page(state: &Jarvis, p: Paint) -> El {
+    use crate::updates::UpdatePhase;
+
+    let updates = &state.updates;
+    let busy = updates.phase.is_busy();
+    let status_color = match updates.phase {
+        UpdatePhase::ReadyToInstall | UpdatePhase::UpToDate => success_color(),
+        UpdatePhase::Available => p.accent,
+        UpdatePhase::Error => warning_color(),
+        _ => p.t.text_secondary,
+    };
+    let status_detail = format!("{} · current v{}", updates.phase.label(), updates.current);
+
+    let mut release_card = card(p, "updates-release")
+        .child(section_heading(p, "Release"))
+        .child(
+            row()
+                .w_full()
+                .gap(10.0)
+                .center_y()
+                .child(
+                    el().size(7.0, 7.0)
+                        .radius(3.5)
+                        .fill(status_color)
+                        .a11y_hidden(),
+                )
+                .child(text(status_detail).font(type_::LABEL).color(status_color)),
+        );
+
+    if let Some(latest) = updates.latest_version() {
+        release_card = release_card.child(info_row(p, "Available", &format!("v{latest}")));
+        if let Some(asset) = updates.asset() {
+            let kind = asset.kind().map(|kind| kind.label()).unwrap_or("Artifact");
+            release_card = release_card.child(info_row(
+                p,
+                kind,
+                &format!(
+                    "{} · {}",
+                    asset.name,
+                    crate::updates::human_bytes(asset.bytes)
+                ),
+            ));
+        }
+        if let Some(release) = &updates.latest {
+            if !release.published_at.is_empty() {
+                release_card = release_card.child(info_row(p, "Published", &release.published_at));
+            }
+        }
+    }
+
+    if let Some(error) = &updates.error {
+        release_card = release_card.child(
+            text(error.clone())
+                .font(type_::LABEL)
+                .color(warning_color()),
+        );
+    }
+
+    if matches!(
+        updates.phase,
+        UpdatePhase::Downloading | UpdatePhase::Verifying
+    ) {
+        let fraction = if updates.phase == UpdatePhase::Verifying {
+            1.0
+        } else {
+            updates.download.fraction()
+        };
+        release_card = release_card.child(
+            row()
+                .w_full()
+                .gap(12.0)
+                .center_y()
+                .child(progress_bar(p, "update-progress", 260.0, fraction))
+                .child(
+                    text(updates.download.label())
+                        .font(type_::LABEL)
+                        .color(p.t.text_secondary),
+                ),
+        );
+    }
+
+    if let Some(signature) = &updates.verified {
+        let tone = if signature.trusted {
+            success_color()
+        } else {
+            warning_color()
+        };
+        release_card = release_card.child(
+            text(format!("Signature · {}", signature.detail))
+                .font(type_::LABEL)
+                .color(tone),
+        );
+    }
+
+    let can_check = !busy && state.settings.check_for_updates;
+    let can_download = updates.can_download() && !busy;
+    let can_install = updates.can_install() && !busy;
+
+    let mut actions = row().key("update-actions").gap(8.0).pt(4.0);
+    actions = actions.child(secondary_button(
+        p,
+        "update-check",
+        if updates.latest.is_some() {
+            "Check again"
+        } else {
+            "Check for updates"
+        },
+        can_check,
+        Jarvis::check_for_updates,
+    ));
+    if updates.phase == UpdatePhase::Available || updates.can_download() {
+        actions = actions.child(primary_button(
+            p,
+            "update-download",
+            "Download",
+            can_download,
+            Jarvis::download_update,
+        ));
+    }
+    if updates.can_install() {
+        actions = actions.child(primary_button(
+            p,
+            "update-install",
+            "Install and restart",
+            can_install,
+            Jarvis::install_update,
+        ));
+        actions = actions.child(secondary_button(
+            p,
+            "update-reveal",
+            "Show download",
+            true,
+            Jarvis::reveal_update,
+        ));
+    }
+    release_card = release_card.child(actions);
+
+    let mut channel_segments = row().key("update-channels").gap(4.0);
+    for channel in jarvis_core::UpdateChannel::ALL {
+        let active = state.settings.update_channel == channel;
+        let mut segment = el()
+            .key(format!("update-channel-{}", channel.label().to_lowercase()))
+            .h(28.0)
+            .px(14.0)
+            .radius(radius::SM)
+            .center()
+            .focusable(true)
+            .role("button")
+            .label(channel.label())
+            .on_press(move |state: &mut Jarvis| state.set_update_channel(channel));
+        segment = if active {
+            segment.fill(p.t.indicator)
+        } else {
+            segment.hover(p.t.hover)
+        };
+        channel_segments = channel_segments.child(segment.child(
+            text(channel.label()).font(type_::LABEL).color(if active {
+                p.t.text
+            } else {
+                p.t.text_secondary
+            }),
+        ));
+    }
+
+    col()
+        .key("updates-page")
+        .w_full()
+        .max_w(820.0)
+        .gap(16.0)
+        .child(release_card)
+        .child(
+            card(p, "updates-settings")
+                .child(section_heading(p, "Updates"))
+                .child(startup_row(
+                    p,
+                    "toggle-check-for-updates",
+                    "Check automatically",
+                    "Once a day after start-up, from GitHub releases.",
+                    state.settings.check_for_updates,
+                    true,
+                    |state| {
+                        let next = !state.settings.check_for_updates;
+                        state.set_check_for_updates(next);
+                    },
+                ))
+                .child(startup_row(
+                    p,
+                    "toggle-auto-download",
+                    "Download automatically",
+                    "Only checksum-listed artifacts with a verified signature.",
+                    state.settings.auto_download_updates,
+                    state.settings.check_for_updates,
+                    |state| {
+                        let next = !state.settings.auto_download_updates;
+                        state.set_auto_download_updates(next);
+                    },
+                ))
+                .child(
+                    row()
+                        .w_full()
+                        .justify_between()
+                        .center_y()
+                        .py(7.0)
+                        .child(
+                            col()
+                                .grow(1.0)
+                                .min_w(0.0)
+                                .gap(2.0)
+                                .child(text("Channel").font(type_::BODY).color(p.t.text))
+                                .child(
+                                    text(state.settings.update_channel.detail())
+                                        .font(type_::LABEL)
+                                        .color(p.t.text_secondary),
+                                ),
+                        )
+                        .child(channel_segments),
+                )
+                .child(
+                    text("Downloads are verified against SHA256SUMS.txt, then the Authenticode signature, before Install appears.")
+                        .font(type_::LABEL)
+                        .color(p.t.text_secondary)
+                        .wrap(),
+                ),
+        )
+        .child(updates_trust_card(state, p))
+}
+
+fn updates_trust_card(state: &Jarvis, p: Paint) -> El {
+    let mut card = card(p, "updates-trust")
+        .child(section_heading(p, "Signing"))
+        .child(info_row(
+            p,
+            "Policy",
+            if state.updates.signature_required {
+                "Signed artifacts only"
+            } else {
+                "Unsigned artifacts allowed"
+            },
+        ))
+        .child(info_row(
+            p,
+            "Publisher pin",
+            &jarvis_core::update::publisher_pin().unwrap_or_else(|| "Not pinned".into()),
+        ));
+
+    if let Some(checked) = &state.updates.last_checked {
+        card = card.child(info_row(p, "Last checked", checked));
+    }
+
+    card.child(
+        text("Pin releases to one signer with JARVIS_UPDATE_PUBLISHER.")
+            .font(type_::LABEL)
+            .color(p.t.text_secondary),
+    )
+}
+
 fn about_page(state: &Jarvis, p: Paint) -> El {
     col()
         .key("about-page")
@@ -1804,7 +2061,7 @@ fn about_page(state: &Jarvis, p: Paint) -> El {
                 .child(section_heading(p, "About"))
                 .child(info_row(p, "Application", "Jarvis for Windows"))
                 .child(info_row(p, "Version", state.version))
-                .child(info_row(p, "Build", "Phase 6 · packaged release"))
+                .child(info_row(p, "Build", "Phase 7 · signed updates"))
                 .child(info_row(p, "Platform", std::env::consts::OS))
                 .child(info_row(
                     p,
@@ -2715,6 +2972,72 @@ mod tests {
 
         press(&mut runtime, "theme-light");
         assert_eq!(runtime.state.settings.theme, ThemeChoice::Light);
+    }
+
+    #[test]
+    fn the_updates_page_offers_check_and_reports_state() {
+        let mut state = Jarvis::for_test();
+        state.settings_page = SettingsPage::Updates;
+        let mut runtime = Runtime::new(state, view, (1120.0, 760.0), Env::new(true, 1.0));
+        runtime.frame(0.0);
+
+        assert!(runtime.find("updates-release").is_some());
+        assert!(runtime.find("update-check").is_some());
+        assert!(runtime.find("update-download").is_none());
+        assert!(runtime.find("update-install").is_none());
+        assert!(runtime.find("toggle-check-for-updates").is_some());
+        assert!(runtime.find("update-channel-stable").is_some());
+        assert!(runtime.find("update-channel-prerelease").is_some());
+    }
+
+    #[test]
+    fn an_available_update_offers_download_then_install() {
+        let mut state = Jarvis::for_test();
+        state.settings_page = SettingsPage::Updates;
+        state.updates.latest = Some(jarvis_core::Release {
+            version: semver::Version::new(0, 2, 0),
+            tag: "v0.2.0".into(),
+            notes: "Notes".into(),
+            notes_url: String::new(),
+            published_at: "2026-01-24T00:00:00Z".into(),
+            assets: vec![jarvis_core::ReleaseAsset {
+                name: "Jarvis-0.2.0-x64-setup.exe".into(),
+                url: "https://example.test/setup".into(),
+                bytes: 24 * 1024 * 1024,
+                sha256: Some("a".repeat(64)),
+            }],
+        });
+        state.updates.phase = crate::updates::UpdatePhase::Available;
+        let mut runtime = Runtime::new(state, view, (1120.0, 760.0), Env::new(true, 1.0));
+        runtime.frame(0.0);
+        assert!(runtime.find("update-download").is_some());
+        assert!(runtime.find("update-install").is_none());
+
+        let mut state = runtime.state;
+        state.updates.phase = crate::updates::UpdatePhase::ReadyToInstall;
+        state.updates.installer = Some(std::path::PathBuf::from("/tmp/Jarvis-0.2.0-x64-setup.exe"));
+        state.updates.verified = Some(jarvis_platform::SignatureStatus {
+            trusted: true,
+            publisher: Some("Jarvis contributors".into()),
+            detail: "Signed by Jarvis contributors.".into(),
+        });
+        let mut runtime = Runtime::new(state, view, (1120.0, 760.0), Env::new(true, 1.0));
+        runtime.frame(0.0);
+        assert!(runtime.find("update-install").is_some());
+        assert!(runtime.find("update-reveal").is_some());
+    }
+
+    #[test]
+    fn pressing_the_channel_segment_updates_the_setting() {
+        let mut state = Jarvis::for_test();
+        state.settings_page = SettingsPage::Updates;
+        let mut runtime = Runtime::new(state, view, (1120.0, 760.0), Env::new(true, 1.0));
+        runtime.frame(0.0);
+        press(&mut runtime, "update-channel-prerelease");
+        assert_eq!(
+            runtime.state.settings.update_channel,
+            jarvis_core::UpdateChannel::Prerelease
+        );
     }
 
     #[test]

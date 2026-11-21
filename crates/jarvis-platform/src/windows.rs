@@ -145,6 +145,161 @@ pub fn open_path(path: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignatureStatus {
+    pub trusted: bool,
+    pub publisher: Option<String>,
+    pub detail: String,
+}
+
+pub fn verify_signature(path: &Path) -> SignatureStatus {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{HANDLE, HWND};
+    use windows::Win32::Security::WinTrust::{
+        WTHelperGetProvCertFromChain, WTHelperGetProvSignerFromChain,
+        WTHelperProvDataFromStateData, WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2,
+        WINTRUST_DATA, WINTRUST_FILE_INFO, WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE,
+        WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut file = WINTRUST_FILE_INFO {
+        cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: PCWSTR(wide.as_ptr()),
+        hFile: HANDLE::default(),
+        pgKnownSubject: std::ptr::null_mut(),
+    };
+    let mut data = WINTRUST_DATA {
+        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_NONE,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        ..Default::default()
+    };
+    data.Anonymous.pFile = &mut file;
+
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    let status = unsafe { WinVerifyTrust(HWND::default(), &mut action, &mut data as *mut _ as _) };
+
+    let mut publisher = None;
+    if status == 0 {
+        let provider = unsafe { WTHelperProvDataFromStateData(data.hWVTStateData) };
+        if !provider.is_null() {
+            let signer = unsafe { WTHelperGetProvSignerFromChain(provider, 0, false, 0) };
+            if !signer.is_null() {
+                let cert = unsafe { WTHelperGetProvCertFromChain(signer, 0) };
+                if !cert.is_null() {
+                    unsafe {
+                        if !(*cert).pCert.is_null() {
+                            publisher = certificate_name((*cert).pCert);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    unsafe {
+        let _ = WinVerifyTrust(HWND::default(), &mut action, &mut data as *mut _ as _);
+    }
+
+    if status == 0 {
+        SignatureStatus {
+            trusted: true,
+            publisher: publisher.clone(),
+            detail: match &publisher {
+                Some(name) => format!("Signed by {name}."),
+                None => "Signature verified.".into(),
+            },
+        }
+    } else {
+        SignatureStatus {
+            trusted: false,
+            publisher,
+            detail: signature_error(status),
+        }
+    }
+}
+
+fn certificate_name(
+    cert: *const windows::Win32::Security::Cryptography::CERT_CONTEXT,
+) -> Option<String> {
+    use windows::Win32::Security::Cryptography::{
+        CertGetNameStringW, CERT_NAME_SIMPLE_DISPLAY_TYPE,
+    };
+
+    unsafe {
+        let required = CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, None, None);
+        if required <= 1 {
+            return None;
+        }
+        let mut buffer = vec![0_u16; required as usize];
+        let written = CertGetNameStringW(
+            cert,
+            CERT_NAME_SIMPLE_DISPLAY_TYPE,
+            0,
+            None,
+            Some(&mut buffer),
+        );
+        if written <= 1 {
+            return None;
+        }
+        let end = buffer.iter().position(|value| *value == 0).unwrap_or(0);
+        Some(String::from_utf16_lossy(&buffer[..end]))
+    }
+}
+
+fn signature_error(code: i32) -> String {
+    use windows::Win32::Foundation::{
+        TRUST_E_BAD_DIGEST, TRUST_E_EXPLICIT_DISTRUST, TRUST_E_NOSIGNATURE,
+        TRUST_E_PROVIDER_UNKNOWN, TRUST_E_SUBJECT_FORM_UNKNOWN,
+    };
+
+    let hresult = windows::core::HRESULT(code);
+    if hresult == TRUST_E_NOSIGNATURE {
+        "The file is not signed.".into()
+    } else if hresult == TRUST_E_BAD_DIGEST {
+        "The signature is invalid; the file may have been modified.".into()
+    } else if hresult == TRUST_E_EXPLICIT_DISTRUST {
+        "The signing certificate is explicitly distrusted on this PC.".into()
+    } else if hresult == TRUST_E_PROVIDER_UNKNOWN || hresult == TRUST_E_SUBJECT_FORM_UNKNOWN {
+        format!("Windows could not validate this file's signature (0x{code:08X}).")
+    } else {
+        format!("Signature verification failed (0x{code:08X}).")
+    }
+}
+
+pub fn launch_installer(path: &Path, silent: bool) -> Result<(), String> {
+    let mut command = Command::new(path);
+    if silent {
+        command.arg("/S");
+    } else {
+        command.arg("/NCRC");
+    }
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+pub fn reveal_path(path: &Path) -> Result<(), String> {
+    Command::new("explorer.exe")
+        .args(["/select,"])
+        .arg(path)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HotkeyEvent {
     Pressed,

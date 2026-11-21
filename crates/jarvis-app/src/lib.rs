@@ -1,9 +1,11 @@
 mod app;
 mod command;
 mod ui;
+mod updates;
 
 pub use app::{HotkeyTarget, Jarvis, Notice, NoticeTone, Section, SettingsPage};
 pub use command::{CommandRecord, CommandUi};
+pub use updates::{DownloadState, UpdateEvent, UpdatePhase, UpdatesUi};
 
 use jarvis_core::insights::day_key_ago;
 use jarvis_core::Insights;
@@ -154,6 +156,27 @@ const SCENES: &[Scene] = &[
         state.setup = Jarvis::demo_report(true);
         state.settings.launch_at_login = true;
         state.settings.close_to_tray = true;
+    }),
+    ("updates", |state| {
+        state.section = Section::Settings;
+        state.settings_page = SettingsPage::Updates;
+        state.setup = Jarvis::demo_report(true);
+        state.auto_update_attempted = true;
+        state.updates.latest = Some(jarvis_core::Release {
+            version: semver::Version::new(0, 2, 0),
+            tag: "v0.2.0".into(),
+            notes: "Packaging, signed releases and the update flow.".into(),
+            notes_url: String::new(),
+            published_at: "2026-01-24T00:00:00Z".into(),
+            assets: vec![jarvis_core::ReleaseAsset {
+                name: "Jarvis-0.2.0-x64-setup.exe".into(),
+                url: String::new(),
+                bytes: 24_100_000,
+                sha256: Some("a".repeat(64)),
+            }],
+        });
+        state.updates.phase = crate::updates::UpdatePhase::Available;
+        state.updates.signature_required = true;
     }),
     ("about", |state| {
         state.section = Section::Settings;

@@ -73,16 +73,34 @@ For local testing, enable Developer Mode and install with:
 Add-AppxPackage -AllowUnsigned .\dist\Jarvis-0.1.0-x64.msix
 ```
 
-For distribution, sign the package and set `Publisher` in
-`packaging/msix/AppxManifest.xml` to the certificate subject:
+For distribution, set `Publisher` in `packaging/msix/AppxManifest.xml` to the
+certificate subject and sign everything with `sign.ps1` (below). The in-app
+updater refuses unsigned artifacts, so a distributed release that should update
+itself must be signed.
+
+## Signing
 
 ```powershell
-signtool sign /fd SHA256 /a /f certificate.pfx /p <password> `
-  dist\Jarvis-0.1.0-x64.msix
+pwsh packaging/windows/sign.ps1 -Version 0.1.0 -Certificate C:\keys\jarvis.pfx
 ```
 
-The same certificate should sign the installer and the executable to avoid
-SmartScreen warnings.
+`sign.ps1` builds (unless `-SkipBuild`), signs `jarvis.exe`, every `.exe` in
+`dist\` and the MSIX with `signtool`, using SHA-256 file digest, SHA-256
+timestamp digest and a DigiCert RFC 3161 timestamp. It verifies each signature
+with `signtool verify /pa /all` and then rewrites `SHA256SUMS.txt`, so the
+published checksums describe the signed bytes.
+
+The certificate password comes from `-Password`, else
+`JARVIS_SIGNING_PASSWORD`; the path may also come from `JARVIS_SIGNING_CERT_FILE`.
+Use a code-signing certificate (not a TLS certificate) from a CA such as DigiCert
+or an internal enterprise CA whose root is deployed to client machines.
+
+### Publisher pinning
+
+The update page verifies the Authenticode signature before offering Install.
+Set `JARVIS_UPDATE_PUBLISHER` on client machines to the expected certificate
+subject or publisher name (comma-separated entries are accepted) to also pin the
+signer. Without the variable the signature must still be trusted.
 
 ## Assets
 
@@ -92,7 +110,19 @@ entries for the executable, installer and shortcuts.
 
 ## Release workflow
 
-`.github/workflows/release.yml` runs on `v*` tags: it builds the release app,
-runs the packaging script, and uploads the portable zip, installer, MSIX and
-checksums to a GitHub release. The workflow produces unsigned artifacts unless
-signing is added to the release environment.
+`.github/workflows/release.yml` runs on `v*` tags (or manually with a version
+input): it builds and tests the app, runs the packaging script, and uploads the
+portable zip, installer, MSIX and checksums to a GitHub release.
+
+Signing is optional per repository. Set both secrets:
+
+| Secret | Content |
+| --- | --- |
+| `WINDOWS_SIGNING_CERTIFICATE` | base64 of the `.pfx` file |
+| `WINDOWS_SIGNING_PASSWORD` | the `.pfx` password |
+
+When present, the workflow writes the certificate to a temporary file, runs
+`sign.ps1 -SkipBuild`, deletes the file and verifies the installer signature
+before uploading. Without the secrets it uploads unsigned artifacts and prints a
+warning: those releases are manual-install only, because the updater refuses
+unsigned downloads.

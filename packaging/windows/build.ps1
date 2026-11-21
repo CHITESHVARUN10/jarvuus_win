@@ -153,15 +153,9 @@ if (-not $SkipMsix) {
     if ($LASTEXITCODE -ne 0) { throw "makeappx failed." }
 }
 
-$artifacts = Get-ChildItem $dist -File | Where-Object { $_.Name -ne "SHA256SUMS.txt" } |
-    Sort-Object Name
-$checksums = foreach ($artifact in $artifacts) {
-    $hash = (Get-FileHash $artifact.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-    "$hash  $($artifact.Name)"
-}
-$checksums | Set-Content (Join-Path $dist "SHA256SUMS.txt") -Encoding ASCII
+& (Join-Path $PSScriptRoot "checksums.ps1") -Directory $dist
+if ($LASTEXITCODE -ne 0) { throw "checksum generation failed." }
 
 Write-Host ""
 Write-Host "Artifacts in ${dist}:"
-$artifacts | ForEach-Object { Write-Host "  $($_.Name)" }
-Write-Host "  SHA256SUMS.txt"
+Get-ChildItem $dist -File | Sort-Object Name | ForEach-Object { Write-Host "  $($_.Name)" }

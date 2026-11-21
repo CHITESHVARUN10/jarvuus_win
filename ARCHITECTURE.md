@@ -139,6 +139,8 @@ and `-1743` handling have no Windows equivalent and are not ported.
 | `insights.json` | Command totals, branch counts and daily buckets |
 | `logs/commands.log` | Append-only app/setup log, rotated at 4 MiB |
 | `logs/commands.log.1` | Previous log after rotation |
+| `update-check.json` | Last successful update check (gates daily checks) |
+| `updates/` | Verified installer downloads |
 | `models/ggml-large-v3-turbo.bin` | Whisper model |
 | `models/ggml-large-v3-turbo.bin.part` | Resumable speech download |
 | `models/intent/current.json` | Active managed intent release |
@@ -403,8 +405,38 @@ Performance hardening is bounded storage rather than a new scheduler:
   unload. The UI/tray path is event-driven through the Rune waker rather than
   polling.
 
-Code signing, signed MSIX distribution and auto-update remain Phase 7. The
-current release artifacts are unsigned.
+## Code signing and updates
+
+`packaging/windows/sign.ps1` signs the executable, the installer and the MSIX
+with `signtool` and a DigiCert RFC 3161 timestamp, verifies each signature with
+`/pa /all`, and rewrites `SHA256SUMS.txt` over the signed bytes. The release
+workflow runs it only when `WINDOWS_SIGNING_CERTIFICATE` and
+`WINDOWS_SIGNING_PASSWORD` are set, and verifies the installer before upload.
+Unsigned runs still publish, but those releases cannot self-update.
+
+The updater is split by trust boundary:
+
+- `jarvis-core::update` parses the GitHub release JSON, filters by channel,
+  parses `SHA256SUMS.txt`, streams assets with a 512 MiB cap, verifies SHA-256
+  and rejects unsafe asset names. It never executes anything.
+- `jarvis-app::updates` owns the phase machine (`Checking` → `Available` →
+  `Downloading` → `Verifying` → `ReadyToInstall` → `Installing`) and runs one
+  background thread per check or download, waking the Rune event loop through
+  the same waker as the model and speech workers. A successful check is written
+  to `update-check.json`, which gates automatic checks to once a day.
+- `jarvis-platform::verify_signature` wraps WinTrust (`WinVerifyTrust` plus the
+  provider signer chain for the publisher name) and returns a plain
+  `SignatureStatus`, so the app crate holds no `windows` API calls.
+- `jarvis-platform::launch_installer` starts the NSIS installer; `install_update`
+  then quits Jarvis through `AppHandle::quit` so files can be replaced.
+
+Unsigned downloads are refused unless `JARVIS_ALLOW_UNSIGNED_UPDATE=1` is set
+for development. `JARVIS_UPDATE_PUBLISHER` optionally pins the signer. The
+checksum is required before the download starts, so a release without a
+`SHA256SUMS.txt` entry cannot be installed.
+
+Signed MSIX distribution through the Microsoft Store would need a Partner Center
+identity; the current pipeline signs the package for direct/sideload use.
 
 ## CI
 

@@ -31,6 +31,29 @@ pub fn open_target(target: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignatureStatus {
+    pub trusted: bool,
+    pub publisher: Option<String>,
+    pub detail: String,
+}
+
+pub fn verify_signature(_path: &Path) -> SignatureStatus {
+    SignatureStatus {
+        trusted: false,
+        publisher: None,
+        detail: "Signature verification is Windows only.".into(),
+    }
+}
+
+pub fn launch_installer(_path: &Path, _silent: bool) -> Result<(), String> {
+    Err("Installing updates is Windows only.".into())
+}
+
+pub fn reveal_path(_path: &Path) -> Result<(), String> {
+    Err("Revealing files is Windows only.".into())
+}
+
 pub fn open_path(path: &Path) -> Result<(), String> {
     Command::new("open")
         .arg(path)

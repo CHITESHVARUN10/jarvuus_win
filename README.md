@@ -8,7 +8,7 @@ The macOS project is cloned into `jarvuss/` for reference and is ignored by git.
 
 ## Status
 
-**Phase 6 complete: Windows packaging, release artifacts and performance hardening.**
+**Phase 7 complete: code signing, verified auto-update and signed release distribution.**
 
 - Rune (native GPU-rendered Rust UI) application window with navigation.
 - First-run setup with essentials progress, status chips and per-item fixes.
@@ -54,9 +54,15 @@ The macOS project is cloned into `jarvuss/` for reference and is ignored by git.
 - Release workflow on `v*` tags that builds and uploads all Windows artifacts.
 - Fat-LTO release profile, a 4 MiB rotating command log, bounded command history
   and the existing model idle unload.
+- Signed releases: `packaging/windows/sign.ps1` signs the executable, installer
+  and MSIX with timestamping and rewrites `SHA256SUMS.txt` over the signed bytes.
+- In-app updates: GitHub release discovery, channel filtering, checksum-checked
+  downloads, mandatory Authenticode verification and optional publisher pinning
+  before the installer is offered.
 - Cross-platform dev preview: the same app runs on macOS for UI work.
 - GitHub Actions on Windows and macOS: formatting, clippy, tests, build; a
-  tag-driven Windows release workflow.
+  tag-driven Windows release workflow that signs when the certificate secret is
+  configured.
 
 ## UI
 
@@ -144,12 +150,32 @@ The script writes `dist\` with:
 The installer writes to `%LOCALAPPDATA%\Programs\Jarvis`, adds Start menu and
 optional desktop shortcuts, and asks before deleting user data during uninstall.
 The target machine needs the Microsoft Visual C++ 2015–2022 Redistributable
-(x64); the installer warns if `vcruntime140.dll` is missing. The MSIX is unsigned
-by default; see
-[packaging/windows/README.md](packaging/windows/README.md) for sideloading and
-signing. Pushing a `v*` tag runs `.github/workflows/release.yml`, which repeats
-the build and uploads these files to a GitHub release. Bump the workspace
+(x64); the installer warns if `vcruntime140.dll` is missing. To sign, run
+`pwsh packaging/windows/sign.ps1 -Version 0.1.0 -Certificate <pfx>`; it signs the
+executable, installer and MSIX with an RFC 3161 timestamp, verifies the result
+and rewrites `SHA256SUMS.txt` so the published hashes cover the signed bytes.
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which repeats the build,
+signs when `WINDOWS_SIGNING_CERTIFICATE` and `WINDOWS_SIGNING_PASSWORD` are
+configured, and uploads everything to a GitHub release. Bump the workspace
 `Cargo.toml` version before tagging; the packaging script rejects a mismatch.
+
+## Updates
+
+Settings → Updates checks GitHub releases at most once a day after start-up.
+Stable accepts final releases; Prerelease also accepts beta and release-candidate
+tags. Downloads:
+
+1. Require the asset to be listed in the release's `SHA256SUMS.txt`.
+2. Stream into `updates/` with a size cap, retrying from scratch on a mismatch.
+3. Verify the SHA-256, then the Authenticode signature and publisher pin.
+4. Only then offer **Install and restart**, which starts the signed installer and
+   quits Jarvis so it can replace `jarvis.exe`.
+
+Unsigned artifacts are refused unless `JARVIS_ALLOW_UNSIGNED_UPDATE=1` is set for
+development. Pin releases to one signer with `JARVIS_UPDATE_PUBLISHER` (a
+certificate subject or publisher name). A manual release from an unsigned
+workflow run is manual-install only. Update checks and outcomes are written to
+the command log.
 
 On macOS the UI preview runs with the same command. Microphone and GPU probes
 report that they are Windows-only, and the app uses `JarvisWindows` as its data
@@ -194,6 +220,8 @@ On Windows everything lives under `%LOCALAPPDATA%\Jarvis`:
   insights.json                     local command totals and daily buckets
   logs\commands.log                 timestamped app and setup log
   logs\commands.log.1               previous log after the 4 MiB rotation
+  update-check.json                 last successful update check
+  updates\                          verified installer downloads
   models\
     ggml-large-v3-turbo.bin         speech model (about 1.5 GB)
     ggml-large-v3-turbo.bin.part    resumable partial download
@@ -365,7 +393,8 @@ and a failed registration leaves the old one working. Defaults are
 | 4 | Command planner/actions, Windows app/URL/volume/media/files/settings | Done |
 | 5 | Routines, insights, tray, startup, hotkey settings, UI parity | Done |
 | 6 | Packaging (MSIX/NSIS), release artifacts, performance hardening | Done |
-| 7 | Code signing, auto-update, signed MSIX distribution | Planned |
+| 7 | Code signing, auto-update, signed MSIX distribution | Done |
+| 8 | Silent-background login launch, floating dictation pill, insights export | Planned |
 
 Architecture and porting notes: [ARCHITECTURE.md](ARCHITECTURE.md).
 

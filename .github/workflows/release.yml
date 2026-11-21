@@ -21,6 +21,11 @@ jobs:
   windows:
     name: Windows x64
     runs-on: windows-latest
+    env:
+      # Optional signing secrets; the sign step is skipped when the certificate
+      # is not configured.
+      WINDOWS_SIGNING_CERTIFICATE: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE }}
+      WINDOWS_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -69,6 +74,42 @@ jobs:
             "${{ github.ref_name }}"
           }
           ./packaging/windows/build.ps1 -Version $version -SkipBuild
+
+      # Unsigned builds still publish. When the signing secrets exist, sign.ps1
+      # rewrites SHA256SUMS.txt so the published hashes cover the signed bytes.
+      - name: Sign artifacts
+        if: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE != '' }}
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_CERTIFICATE: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE }}
+          WINDOWS_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
+        run: |
+          $cert = Join-Path $env:RUNNER_TEMP "jarvis-signing.pfx"
+          [IO.File]::WriteAllBytes($cert, [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERTIFICATE))
+          try {
+            ./packaging/windows/sign.ps1 -Version "${{ github.ref_name }}" -Certificate $cert -Password $env:WINDOWS_SIGNING_PASSWORD -SkipBuild
+          } finally {
+            Remove-Item $cert -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Verify installer signature
+        if: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE != '' }}
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match '\\x64\\signtool.exe$' } |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          Get-ChildItem dist -Filter "*-setup.exe" | ForEach-Object {
+            & $signtool verify /pa /all $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "$($_.Name) is not signed" }
+          }
+
+      - name: Warn on unsigned release
+        if: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE == '' }}
+        shell: pwsh
+        run: |
+          Write-Warning "Artifacts are unsigned: WINDOWS_SIGNING_CERTIFICATE is not configured."
+          Write-Warning "Clients refuse unsigned updates, so this release is manual-install only."
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

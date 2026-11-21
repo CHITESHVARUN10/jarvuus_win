@@ -19,8 +19,9 @@ use stub as imp;
 use windows as imp;
 
 pub use imp::{
-    copy_text, insert_text, set_launch_at_login, start_command_hotkey, start_dictation_hotkey,
-    HotkeyEvent, HotkeyRegistration, InsertionOutcome,
+    copy_text, insert_text, launch_installer, reveal_path, set_launch_at_login,
+    start_command_hotkey, start_dictation_hotkey, verify_signature, HotkeyEvent,
+    HotkeyRegistration, InsertionOutcome, SignatureStatus,
 };
 
 mod execute;
